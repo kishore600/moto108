@@ -18,6 +18,13 @@ interface ServiceCardProps {
   dynamicPrice?: number | null;
   loading?: boolean;
   priceNote?: string | null;
+  // ✅ New: when true, the card shows red "Service Unavailable" text in
+  // place of the price/chevron, dims the whole card, and can't be tapped —
+  // regardless of what `disabled` is set to. This is distinct from
+  // `disabled` (which just mutes styling/interaction for things like an
+  // in-flight booking request) — `unavailable` is a longer-lived "this
+  // service isn't offered right now" state with its own visual treatment.
+  unavailable?: boolean;
 }
 
 export const ServiceCard: React.FC<ServiceCardProps> = ({ 
@@ -27,7 +34,8 @@ export const ServiceCard: React.FC<ServiceCardProps> = ({
   selectedVehicle,
   dynamicPrice,
   loading,
-  priceNote 
+  priceNote,
+  unavailable,
 }) => {
   const displayPrice = dynamicPrice !== null && dynamicPrice !== undefined 
     ? dynamicPrice 
@@ -37,9 +45,9 @@ export const ServiceCard: React.FC<ServiceCardProps> = ({
 
   return (
     <TouchableOpacity 
-      style={[styles.card, disabled && styles.disabledCard]} 
+      style={[styles.card, (disabled || unavailable) && styles.disabledCard]} 
       onPress={onPress}
-      disabled={disabled || loading}
+      disabled={disabled || loading || unavailable}
     >
       <View style={styles.cardContent}>
         <View style={styles.iconContainer}>
@@ -57,13 +65,13 @@ export const ServiceCard: React.FC<ServiceCardProps> = ({
               <Text style={styles.vehicleInfo}>
                 For {selectedVehicle.name}
               </Text>
-              {priceNote && (
+              {priceNote && !unavailable && (
                 <Text style={styles.priceNote}>{priceNote}</Text>
               )}
             </View>
           )}
           
-          {isPriceDifferent && (
+          {isPriceDifferent && !unavailable && (
             <View style={styles.priceComparison}>
               <Text style={styles.basePriceStrikethrough}>
                 ₹{item.base_price}
@@ -76,7 +84,9 @@ export const ServiceCard: React.FC<ServiceCardProps> = ({
         </View>
         
         <View style={styles.priceContainer}>
-          {loading ? (
+          {unavailable ? (
+            <Text style={styles.unavailableText}>Currently{"\n"}Unavailable</Text>
+          ) : loading ? (
             <ActivityIndicator size="small" color="#0F172A" />
           ) : (
             <>
@@ -94,7 +104,7 @@ const styles = StyleSheet.create({
   card: {
     // backgroundColor: "#FFF",
     borderRadius: 12,
-    marginBottom: 12,
+    
     padding: 16,
     borderWidth: 1,
     borderColor: "#E2E8F0",
@@ -165,5 +175,13 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: "#0F172A",
     marginBottom: 4,
+  },
+  // ✅ Red "Service Unavailable" label shown in place of the price/chevron
+  unavailableText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#DC2626",
+    textAlign: "right",
+    lineHeight: 16,
   },
 });
