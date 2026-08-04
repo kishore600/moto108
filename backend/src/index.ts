@@ -12,7 +12,7 @@ import { mechanicsRouter } from "./routes/mechanics.routes";
 import { initSocket } from "./socket";
 import cookieParser from "cookie-parser";
 import { authMiddleware } from "./middleware/auth";
-import { authRouter } from "./routes/auth.routes";
+import authRouter from "./routes/auth.routes";
 import savedLocationRouter from "./routes/savedLocations.routes";
 import profileRoutes from "./routes/profile.routes";
 

@@ -2,7 +2,7 @@
   "expo": {
     "name": "Moto108",
     "slug": "moto-108",
-    "version": "21.0.0",
+    "version": "22.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "ui",
@@ -13,7 +13,7 @@
     },
     "android": {
       "package": "com.moto108.emergency",
-      "versionCode": 21,
+      "versionCode": 22,
       "config": {
         "googleMaps": {
           "apiKey": "AIzaSyDwLkPpLwhKZfnkZ1e3W_cdg78xfS6fvfM"

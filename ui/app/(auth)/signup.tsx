@@ -1,8 +1,10 @@
-import { useEffect, useState } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform, ActivityIndicator, ScrollView } from 'react-native';
+// app/(auth)/signup.tsx
+import { useState, useEffect } from 'react';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform, ActivityIndicator, ScrollView, Alert } from 'react-native';
 import { router, Link } from 'expo-router';
 import { useAuth } from '@/context/AuthContext';
 import * as SecureStore from 'expo-secure-store';
+import { api } from '@/lib/api';
 
 export default function SignupScreen() {
   const [email, setEmail] = useState('');
@@ -10,49 +12,149 @@ export default function SignupScreen() {
   const [fullName, setFullName] = useState('');
   const [phone, setPhone] = useState('');
   const [role, setRole] = useState<'customer' | 'mechanic'>('customer');
+  const [otp, setOtp] = useState('');
+  const [otpSent, setOtpSent] = useState(false);
   const [loading, setLoading] = useState(false);
-  const { signup,user } = useAuth();
+  const [otpLoading, setOtpLoading] = useState(false);
+  const [countdown, setCountdown] = useState(0);
+  const [step, setStep] = useState<'details' | 'otp'>('details');
+  const { user } = useAuth();
 
-    useEffect(() => {
-      checkExistingSession();
-    }, [user]);
-    
-    async function checkExistingSession() {
-      try {
-        const token = await SecureStore.getItemAsync('token');
-        const userData = await SecureStore.getItemAsync('user_data');
-        console.log('Existing session check:', { token, userData, user });
-        if (token && userData && user) {
-          // User already logged in, redirect to appropriate screen
-          if (user.role === 'mechanic') {
-            router.replace('/mechanic/dashboard');
-          } else {
-            router.replace('/(tabs)/customer');
-          }
-        }
-      } catch (error) {
-        console.error('Error checking session:', error);
-      }
+  useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (countdown > 0) {
+      timer = setTimeout(() => setCountdown(countdown - 1), 1000);
     }
-  async function handleSignup() {
-    if (!email || !password || !fullName) {
-      alert('Please fill in all required fields');
+    return () => clearTimeout(timer);
+  }, [countdown]);
+
+  useEffect(() => {
+    checkExistingSession();
+  }, [user]);
+
+  useEffect(() => {
+    if (otp.length === 6 && otpSent) {
+      handleVerifyOTP();
+    }
+  }, [otp]);
+
+  async function checkExistingSession() {
+    try {
+      const token = await SecureStore.getItemAsync('token');
+      const userData = await SecureStore.getItemAsync('user_data');
+      if (token && userData && user) {
+        if (user.role === 'mechanic') {
+          router.replace('/mechanic/dashboard');
+        } else {
+          router.replace('/(tabs)/customer');
+        }
+      }
+    } catch (error) {
+      console.error('Error checking session:', error);
+    }
+  }
+
+  async function handleSendOTP() {
+    // Only validate phone and name (email and password are optional)
+    if (!fullName) {
+      Alert.alert('Error', 'Please enter your full name');
       return;
     }
 
-    if (password.length < 6) {
-      alert('Password must be at least 6 characters');
+    const phoneRegex = /^[0-9]{10,15}$/;
+    if (!phoneRegex.test(phone.replace(/[^0-9]/g, ''))) {
+      Alert.alert('Error', 'Please enter a valid phone number');
+      return;
+    }
+
+    // Optional email validation (only if provided)
+    if (email) {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(email)) {
+        Alert.alert('Error', 'Please enter a valid email address');
+        return;
+      }
+    }
+
+    // Optional password validation (only if provided)
+    if (password && password.length < 6) {
+      Alert.alert('Error', 'Password must be at least 6 characters');
+      return;
+    }
+
+    setOtpLoading(true);
+    try {
+      const { data } = await api.post('/auth/send-signup-otp', { phone });
+      
+      if (data.success) {
+        setOtpSent(true);
+        setStep('otp');
+        setCountdown(60);
+        Alert.alert('Success', 'OTP sent successfully!');
+        if (data.devOtp) {
+          Alert.alert('Development OTP', `Your OTP is: ${data.devOtp}`);
+        }
+      } else {
+        Alert.alert('Error', data.error || 'Failed to send OTP');
+      }
+    } catch (error: any) {
+      console.error('Send OTP error:', error);
+      Alert.alert('Error', error.message || 'Failed to send OTP');
+    } finally {
+      setOtpLoading(false);
+    }
+  }
+
+  async function handleVerifyOTP() {
+    if (!otp || otp.length !== 6) {
+      Alert.alert('Error', 'Please enter a valid 6-digit OTP');
       return;
     }
 
     setLoading(true);
     try {
-      await signup({ email, password, fullName, role, phone });
-    } catch (error) {
-      // Error handled in auth context
+      const { data } = await api.post('/auth/verify-signup-otp', {
+        phone,
+        otp,
+        email: email || null, // Send null if not provided
+        password: password || null, // Send null if not provided
+        fullName,
+        role
+      });
+      
+      if (data.success) {
+        await api.setToken(data.token);
+        await api.setUser(data.user);
+        await SecureStore.setItemAsync('token', data.token);
+        await SecureStore.setItemAsync('user_data', JSON.stringify(data.user));
+        
+        if (data.user.role === 'mechanic') {
+          router.replace('/mechanic/dashboard');
+        } else {
+          router.replace('/(tabs)/customer');
+        }
+      } else {
+        Alert.alert('Signup Failed', data.error || 'Invalid OTP');
+      }
+    } catch (error: any) {
+      console.error('Verify OTP error:', error);
+      Alert.alert('Error', error.message || 'Verification failed');
     } finally {
       setLoading(false);
     }
+  }
+
+  function resetOTPFlow() {
+    setOtpSent(false);
+    setOtp('');
+    setCountdown(0);
+    setStep('details');
+  }
+
+  function formatPhoneNumber(text: string) {
+    const cleaned = text.replace(/[^0-9]/g, '');
+    if (cleaned.length <= 10) return cleaned;
+    return cleaned.slice(0, 15);
   }
 
   return (
@@ -64,80 +166,140 @@ export default function SignupScreen() {
         <ScrollView contentContainerStyle={styles.scrollContent}>
           <View style={styles.content}>
             <Text style={styles.title}>Create Account</Text>
-            <Text style={styles.subtitle}>Sign up to get started</Text>
+            <Text style={styles.subtitle}>Sign up with your phone number</Text>
 
             <View style={styles.form}>
-              <TextInput
-                style={styles.input}
-                placeholder="Full Name *"
-                value={fullName}
-                onChangeText={setFullName}
-                editable={!loading}
-              />
+              {step === 'details' ? (
+                // Registration Details
+                <>
+                  <TextInput
+                    style={styles.input}
+                    placeholder="Full Name *"
+                    placeholderTextColor="#94A3B8"
+                    value={fullName}
+                    onChangeText={setFullName}
+                    editable={!otpLoading}
+                  />
 
-              <TextInput
-                style={styles.input}
-                placeholder="Email *"
-                value={email}
-                onChangeText={setEmail}
-                autoCapitalize="none"
-                keyboardType="email-address"
-                editable={!loading}
-              />
+                  <TextInput
+                    style={styles.input}
+                    placeholder="Phone Number *"
+                    placeholderTextColor="#94A3B8"
+                    value={phone}
+                    onChangeText={(text) => setPhone(formatPhoneNumber(text))}
+                    keyboardType="phone-pad"
+                    editable={!otpLoading}
+                  />
 
-              <TextInput
-                style={styles.input}
-                placeholder="Phone"
-                value={phone}
-                onChangeText={setPhone}
-                keyboardType="phone-pad"
-                editable={!loading}
-              />
+                  <View style={styles.optionalSection}>
+                    <Text style={styles.optionalLabel}>Optional Information</Text>
+                    <Text style={styles.optionalHint}>You can skip these if you prefer</Text>
+                  </View>
 
-              <TextInput
-                style={styles.input}
-                placeholder="Password *"
-                value={password}
-                onChangeText={setPassword}
-                secureTextEntry
-                editable={!loading}
-              />
+                  <TextInput
+                    style={styles.input}
+                    placeholder="Email (Optional)"
+                    placeholderTextColor="#94A3B8"
+                    value={email}
+                    onChangeText={setEmail}
+                    autoCapitalize="none"
+                    keyboardType="email-address"
+                    editable={!otpLoading}
+                  />
 
-              <View style={styles.roleContainer}>
-                <Text style={styles.roleLabel}>I am a:</Text>
-                <View style={styles.roleButtons}>
-                  <TouchableOpacity
-                    style={[styles.roleButton, role === 'customer' && styles.roleButtonActive]}
-                    onPress={() => setRole('customer')}
+                  <TextInput
+                    style={styles.input}
+                    placeholder="Password (Optional)"
+                    placeholderTextColor="#94A3B8"
+                    value={password}
+                    onChangeText={setPassword}
+                    secureTextEntry
+                    editable={!otpLoading}
+                  />
+
+                  <View style={styles.roleContainer}>
+                    <Text style={styles.roleLabel}>I am a:</Text>
+                    <View style={styles.roleButtons}>
+                      <TouchableOpacity
+                        style={[styles.roleButton, role === 'customer' && styles.roleButtonActive]}
+                        onPress={() => setRole('customer')}
+                        disabled={otpLoading}
+                      >
+                        <Text style={[styles.roleText, role === 'customer' && styles.roleTextActive]}>
+                          Customer
+                        </Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.roleButton, role === 'mechanic' && styles.roleButtonActive]}
+                        onPress={() => setRole('mechanic')}
+                        disabled={otpLoading}
+                      >
+                        <Text style={[styles.roleText, role === 'mechanic' && styles.roleTextActive]}>
+                          Mechanic
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+
+                  <TouchableOpacity 
+                    style={[styles.button, otpLoading && styles.buttonDisabled]} 
+                    onPress={handleSendOTP}
+                    disabled={otpLoading}
+                  >
+                    {otpLoading ? (
+                      <ActivityIndicator color="#FFF" />
+                    ) : (
+                      <Text style={styles.buttonText}>Verify Phone</Text>
+                    )}
+                  </TouchableOpacity>
+                </>
+              ) : (
+                // OTP Verification
+                <>
+                  <View style={styles.otpHeader}>
+                    <Text style={styles.otpText}>
+                      OTP sent to {phone}
+                    </Text>
+                    <TouchableOpacity onPress={resetOTPFlow}>
+                      <Text style={styles.editLink}>Edit</Text>
+                    </TouchableOpacity>
+                  </View>
+
+                  <TextInput
+                    style={[styles.input, styles.otpInput]}
+                    placeholder="Enter 6-digit OTP"
+                    placeholderTextColor="#94A3B8"
+                    value={otp}
+                    onChangeText={setOtp}
+                    keyboardType="number-pad"
+                    maxLength={6}
+                    editable={!loading}
+                    autoFocus={true}
+                  />
+
+                  <TouchableOpacity 
+                    style={[styles.button, loading && styles.buttonDisabled]} 
+                    onPress={handleVerifyOTP}
                     disabled={loading}
                   >
-                    <Text style={[styles.roleText, role === 'customer' && styles.roleTextActive]}>
-                      Customer
-                    </Text>
+                    {loading ? (
+                      <ActivityIndicator color="#FFF" />
+                    ) : (
+                      <Text style={styles.buttonText}>Verify & Create Account</Text>
+                    )}
                   </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.roleButton, role === 'mechanic' && styles.roleButtonActive]}
-                    onPress={() => setRole('mechanic')}
-                    disabled={loading}
-                  >
-                    <Text style={[styles.roleText, role === 'mechanic' && styles.roleTextActive]}>
-                      Mechanic
-                    </Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
 
-              <TouchableOpacity 
-                style={[styles.button, loading && styles.buttonDisabled]} 
-                onPress={handleSignup}
-                disabled={loading}
-              >
-                {loading ? (
-                  <ActivityIndicator color="#FFF" />
-                ) : (
-                  <Text style={styles.buttonText}>Sign Up</Text>
-                )}
-              </TouchableOpacity>
+                  {countdown > 0 ? (
+                    <Text style={styles.resendText}>
+                      Resend OTP in {countdown}s
+                    </Text>
+                  ) : (
+                    <TouchableOpacity onPress={handleSendOTP}>
+                      <Text style={styles.resendLink}>Resend OTP</Text>
+                    </TouchableOpacity>
+                  )}
+                </>
+              )}
 
               <View style={styles.footer}>
                 <Text style={styles.footerText}>Already have an account? </Text>
@@ -170,6 +332,27 @@ const styles = StyleSheet.create({
     fontSize: 16,
     borderWidth: 1,
     borderColor: '#E2E8F0',
+    color: '#0F172A',
+  },
+  otpInput: {
+    textAlign: 'center',
+    fontSize: 20,
+    letterSpacing: 8,
+    fontWeight: '600',
+  },
+  optionalSection: {
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  optionalLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#0F172A',
+  },
+  optionalHint: {
+    fontSize: 12,
+    color: '#94A3B8',
+    marginTop: 2,
   },
   roleContainer: {
     gap: 8,
@@ -218,6 +401,34 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
     textAlign: 'center',
+  },
+  otpHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  otpText: {
+    fontSize: 14,
+    color: '#64748B',
+  },
+  editLink: {
+    fontSize: 14,
+    color: '#0F172A',
+    fontWeight: '600',
+  },
+  resendText: {
+    textAlign: 'center',
+    fontSize: 14,
+    color: '#94A3B8',
+    marginTop: 8,
+  },
+  resendLink: {
+    textAlign: 'center',
+    fontSize: 14,
+    color: '#0F172A',
+    fontWeight: '600',
+    marginTop: 8,
   },
   footer: {
     flexDirection: 'row',

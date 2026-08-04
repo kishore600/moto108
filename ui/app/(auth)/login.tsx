@@ -1,4 +1,4 @@
-/* eslint-disable react/no-string-refs */
+// app/(auth)/login.tsx
 import { useState, useEffect } from 'react';
 import { 
   View, Text, TextInput, TouchableOpacity, StyleSheet, 
@@ -11,16 +11,13 @@ import * as SecureStore from 'expo-secure-store';
 import { api } from '@/lib/api'; 
 
 export default function LoginScreen() {
-  const [loginMethod, setLoginMethod] = useState<'email' | 'phone'>('email');
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
   const [phone, setPhone] = useState('');
   const [otp, setOtp] = useState('');
   const [otpSent, setOtpSent] = useState(false);
   const [loading, setLoading] = useState(false);
   const [otpLoading, setOtpLoading] = useState(false);
   const [countdown, setCountdown] = useState(0);
-  const { login, user } = useAuth();
+  const { user } = useAuth();
 
   // Countdown timer for OTP resend
   useEffect(() => {
@@ -40,7 +37,6 @@ export default function LoginScreen() {
     try {
       const token = await SecureStore.getItemAsync('token');
       const userData = await SecureStore.getItemAsync('user_data');
-      console.log('Existing session check:', { token, userData, user });
       if (token && userData && user) {
         if (user.role === 'mechanic') {
           router.replace('/mechanic/dashboard');
@@ -53,7 +49,7 @@ export default function LoginScreen() {
     }
   }
 
-  // Send OTP - 使用 API 类
+  // Send OTP for login
   async function handleSendOTP() {
     if (!phone) {
       Alert.alert('Error', 'Please enter your phone number');
@@ -89,7 +85,7 @@ export default function LoginScreen() {
     }
   }
 
-  // Verify OTP and login - 使用 API 类
+  // Verify OTP and login
   async function handleVerifyOTP() {
     if (!otp || otp.length !== 6) {
       Alert.alert('Error', 'Please enter a valid 6-digit OTP');
@@ -98,19 +94,14 @@ export default function LoginScreen() {
 
     setLoading(true);
     try {
-      // 使用 api.post 方法
       const { data } = await api.post('/auth/verify-otp', { phone, otp });
       
       if (data.success) {
-        // Store token and user data using api methods
         await api.setToken(data.token);
         await api.setUser(data.user);
-        
-        // Also store in SecureStore for compatibility
         await SecureStore.setItemAsync('token', data.token);
         await SecureStore.setItemAsync('user_data', JSON.stringify(data.user));
         
-        // Navigate based on role
         if (data.user.role === 'mechanic') {
           router.replace('/mechanic/dashboard');
         } else {
@@ -127,45 +118,24 @@ export default function LoginScreen() {
     }
   }
 
-  // Email/Password login - 使用现有的 login 函数（应该已经在使用 API）
-  async function handleEmailLogin() {
-    if (!email || !password) {
-      Alert.alert('Error', 'Please fill in all fields');
-      return;
-    }
-
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      Alert.alert('Error', 'Please enter a valid email address');
-      return;
-    }
-
-    setLoading(true);
-    try {
-      const success = await login(email, password);
-      if (success) {
-        console.log('Login successful');
-      }
-    } catch (error: any) {
-      Alert.alert('Login Failed', error.message || 'Invalid credentials. Please try again.');
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  // Reset OTP flow
   function resetOTPFlow() {
     setOtpSent(false);
     setOtp('');
     setCountdown(0);
   }
 
-  // Format phone number for display
   function formatPhoneNumber(text: string) {
     const cleaned = text.replace(/[^0-9]/g, '');
     if (cleaned.length <= 10) return cleaned;
     return cleaned.slice(0, 15);
   }
+
+  // Auto-submit OTP when 6 digits are entered
+  useEffect(() => {
+    if (otp.length === 6 && otpSent) {
+      handleVerifyOTP();
+    }
+  }, [otp]);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -177,151 +147,83 @@ export default function LoginScreen() {
           <View style={styles.logoContainer}>
             <Text style={styles.logo}>🚗</Text>
             <Text style={styles.title}>Welcome Back</Text>
-            <Text style={styles.subtitle}>Login to your account</Text>
-          </View>
-
-          {/* Login Method Toggle */}
-          <View style={styles.toggleContainer}>
-            <TouchableOpacity
-              style={[styles.toggleButton, loginMethod === 'email' && styles.toggleActive]}
-              onPress={() => {
-                setLoginMethod('email');
-                resetOTPFlow();
-              }}
-            >
-              <Text style={[styles.toggleText, loginMethod === 'email' && styles.toggleTextActive]}>
-                Email Login
-              </Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.toggleButton, loginMethod === 'phone' && styles.toggleActive]}
-              onPress={() => {
-                setLoginMethod('phone');
-                resetOTPFlow();
-              }}
-            >
-              <Text style={[styles.toggleText, loginMethod === 'phone' && styles.toggleTextActive]}>
-                Phone Login
-              </Text>
-            </TouchableOpacity>
+            <Text style={styles.subtitle}>Login with your phone number</Text>
           </View>
 
           <View style={styles.form}>
-            {loginMethod === 'email' ? (
-              // Email/Password Login Form
+            {!otpSent ? (
+              // Phone number input
               <>
                 <TextInput
                   style={styles.input}
-                  placeholder="Email"
+                  placeholder="Phone Number"
                   placeholderTextColor="#94A3B8"
-                  value={email}
-                  onChangeText={setEmail}
-                  autoCapitalize="none"
-                  keyboardType="email-address"
-                  editable={!loading}
-                  returnKeyType="next"
+                  value={phone}
+                  onChangeText={(text) => setPhone(formatPhoneNumber(text))}
+                  keyboardType="phone-pad"
+                  editable={!otpLoading}
+                  returnKeyType="done"
+                  onSubmitEditing={handleSendOTP}
                 />
+                
+                <TouchableOpacity 
+                  style={[styles.button, otpLoading && styles.buttonDisabled]} 
+                  onPress={handleSendOTP}
+                  disabled={otpLoading}
+                >
+                  {otpLoading ? (
+                    <ActivityIndicator color="#FFF" />
+                  ) : (
+                    <Text style={styles.buttonText}>Send OTP</Text>
+                  )}
+                </TouchableOpacity>
+              </>
+            ) : (
+              // OTP verification
+              <>
+                <View style={styles.otpHeader}>
+                  <Text style={styles.otpText}>
+                    OTP sent to {phone}
+                  </Text>
+                  <TouchableOpacity onPress={resetOTPFlow}>
+                    <Text style={styles.editLink}>Edit</Text>
+                  </TouchableOpacity>
+                </View>
 
                 <TextInput
-                  style={styles.input}
-                  placeholder="Password"
+                  style={[styles.input, styles.otpInput]}
+                  placeholder="Enter 6-digit OTP"
                   placeholderTextColor="#94A3B8"
-                  value={password}
-                  onChangeText={setPassword}
-                  secureTextEntry
+                  value={otp}
+                  onChangeText={setOtp}
+                  keyboardType="number-pad"
+                  maxLength={6}
                   editable={!loading}
                   returnKeyType="done"
-                  onSubmitEditing={handleEmailLogin}
+                  onSubmitEditing={handleVerifyOTP}
+                  autoFocus={true}
                 />
 
                 <TouchableOpacity 
                   style={[styles.button, loading && styles.buttonDisabled]} 
-                  onPress={handleEmailLogin}
+                  onPress={handleVerifyOTP}
                   disabled={loading}
                 >
                   {loading ? (
                     <ActivityIndicator color="#FFF" />
                   ) : (
-                    <Text style={styles.buttonText}>Login</Text>
+                    <Text style={styles.buttonText}>Verify & Login</Text>
                   )}
                 </TouchableOpacity>
-              </>
-            ) : (
-              // Phone OTP Login Form
-              <>
-                {!otpSent ? (
-                  // Phone number input
-                  <>
-                    <TextInput
-                      style={styles.input}
-                      placeholder="Phone Number"
-                      placeholderTextColor="#94A3B8"
-                      value={phone}
-                      onChangeText={(text) => setPhone(formatPhoneNumber(text))}
-                      keyboardType="phone-pad"
-                      editable={!otpLoading}
-                      returnKeyType="done"
-                    />
-                    
-                    <TouchableOpacity 
-                      style={[styles.button, otpLoading && styles.buttonDisabled]} 
-                      onPress={handleSendOTP}
-                      disabled={otpLoading}
-                    >
-                      {otpLoading ? (
-                        <ActivityIndicator color="#FFF" />
-                      ) : (
-                        <Text style={styles.buttonText}>Send OTP</Text>
-                      )}
-                    </TouchableOpacity>
-                  </>
+
+                {countdown > 0 ? (
+                  <Text style={styles.resendText}>
+                    Resend OTP in {countdown}s
+                  </Text>
                 ) : (
-                  // OTP verification
-                  <>
-                    <View style={styles.otpHeader}>
-                      <Text style={styles.otpText}>
-                        OTP sent to {phone} your OTP is ${otp}
-                      </Text>
-                      <TouchableOpacity onPress={resetOTPFlow}>
-                        <Text style={styles.editLink}>Edit</Text>
-                      </TouchableOpacity>
-                    </View>
-
-                    <TextInput
-                      style={styles.input}
-                      placeholder="Enter 6-digit OTP"
-                      placeholderTextColor="#94A3B8"
-                      value={otp}
-                      onChangeText={setOtp}
-                      keyboardType="number-pad"
-                      maxLength={6}
-                      editable={!loading}
-                      returnKeyType="done"
-                      onSubmitEditing={handleVerifyOTP}
-                    />
-
-                    <TouchableOpacity 
-                      style={[styles.button, loading && styles.buttonDisabled]} 
-                      onPress={handleVerifyOTP}
-                      disabled={loading}
-                    >
-                      {loading ? (
-                        <ActivityIndicator color="#FFF" />
-                      ) : (
-                        <Text style={styles.buttonText}>Verify & Login</Text>
-                      )}
-                    </TouchableOpacity>
-
-                    {countdown > 0 ? (
-                      <Text style={styles.resendText}>
-                        Resend OTP in {countdown}s
-                      </Text>
-                    ) : (
-                      <TouchableOpacity onPress={handleSendOTP}>
-                        <Text style={styles.resendLink}>Resend OTP</Text>
-                      </TouchableOpacity>
-                    )}
-                  </>
+                  <TouchableOpacity onPress={handleSendOTP}>
+                    <Text style={styles.resendLink}>Resend OTP</Text>
+                  </TouchableOpacity>
                 )}
               </>
             )}
@@ -350,36 +252,6 @@ const styles = StyleSheet.create({
   title: { fontSize: 32, fontWeight: '800', color: '#0F172A', marginBottom: 8 },
   subtitle: { fontSize: 16, color: '#64748B' },
   
-  toggleContainer: {
-    flexDirection: 'row',
-    backgroundColor: '#F1F5F9',
-    borderRadius: 12,
-    padding: 4,
-    marginBottom: 24,
-  },
-  toggleButton: {
-    flex: 1,
-    paddingVertical: 10,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  toggleActive: {
-    backgroundColor: '#FFF',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 2,
-  },
-  toggleText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#64748B',
-  },
-  toggleTextActive: {
-    color: '#0F172A',
-  },
-  
   form: { gap: 16 },
   input: {
     backgroundColor: '#FFF',
@@ -389,6 +261,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#E2E8F0',
     color: '#0F172A',
+  },
+  otpInput: {
+    textAlign: 'center',
+    fontSize: 20,
+    letterSpacing: 8,
+    fontWeight: '600',
   },
   button: {
     backgroundColor: '#0F172A',
