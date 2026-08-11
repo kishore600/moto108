@@ -18,6 +18,7 @@ import {
   StatusBar,
   Animated,
   Easing,
+  Linking,
 } from "react-native";
 
 import { GestureHandlerRootView } from "react-native-gesture-handler";
@@ -41,7 +42,7 @@ import BottomSheet, {
   BottomSheetFlatList,
 } from "@gorhom/bottom-sheet";
 import * as Location from "expo-location";
-import MapView, { Marker, Callout, Circle, PROVIDER_GOOGLE } from "react-native-maps";
+import MapView, { Marker, Callout, Circle, Polyline, PROVIDER_GOOGLE } from "react-native-maps";
 import MapViewDirections from "react-native-maps-directions";
 import { api } from "@/lib/api";
 import { Booking, Mechanic, ServiceItem, SavedLocation } from "@/types";
@@ -128,9 +129,9 @@ const QUICK_ACCESS_CONFIG: {
 ];
 
 function iconForVehicleCategory(
-  category: string,
+  category?: string | null,
 ): { lib: "Ionicons" | "FontAwesome5" | "MaterialCommunityIcons"; name: string } {
-  switch (category?.toLowerCase()) {
+  switch ((category ?? "").toLowerCase()) {
     case "two-wheeler":
       return { lib: "FontAwesome5", name: "motorcycle" };
     case "auto":
@@ -171,16 +172,28 @@ const DEFAULT_REGION = {
 
 const CLOSE_REGION_DELTA = 0.01;
 
-const MECHANIC_SEARCH_RADIUS_KM = 5;
+// ---------------------------------------------------------------------------
+// ✅ 3-tier expanding search radius: 2km → 5km → 10km.
+// MECHANIC_SEARCH_RADIUS_KM (used for the actual /mechanics/nearby API
+// call) always equals the WIDEST tier, so we fetch once up front and just
+// filter what's shown locally as the search radius expands — no re-fetch
+// needed when a tier changes (fetchNearbyMechanicsForMap still polls on an
+// interval to keep the underlying data fresh).
+// ---------------------------------------------------------------------------
 const MECHANIC_INNER_RING_KM = 2;
+const MECHANIC_MIDDLE_RING_KM = 5;
+const MECHANIC_OUTER_RING_KM = 10;
+const MECHANIC_SEARCH_RADIUS_KM = MECHANIC_OUTER_RING_KM;
 
 const KM_PER_DEGREE_LAT = 111;
 const WAITING_REGION_PADDING = 1.3;
-const WAITING_REGION_DELTA =
-  (MECHANIC_SEARCH_RADIUS_KM * 2 * WAITING_REGION_PADDING) / KM_PER_DEGREE_LAT;
 
 const WAITING_REGION_DELTA_INNER =
   (MECHANIC_INNER_RING_KM * 2 * WAITING_REGION_PADDING) / KM_PER_DEGREE_LAT;
+const WAITING_REGION_DELTA_MIDDLE =
+  (MECHANIC_MIDDLE_RING_KM * 2 * WAITING_REGION_PADDING) / KM_PER_DEGREE_LAT;
+const WAITING_REGION_DELTA_OUTER =
+  (MECHANIC_OUTER_RING_KM * 2 * WAITING_REGION_PADDING) / KM_PER_DEGREE_LAT;
 
 function getMechanicCoordinate(
   mechanic: any,
@@ -214,6 +227,34 @@ function formatTimeAgo(dateStr?: string): string {
   return `${diffDays} days ago`;
 }
 
+// ---------------------------------------------------------------------------
+// ✅ Formats a booking timeline timestamp for the tracking-screen status
+// list. Tries several possible field-name variants per step (different
+// backends/migrations tend to name these slightly differently), so this
+// keeps working even if the API adds/renames a column later. Returns null
+// (never a fabricated value) if nothing usable is found for that step.
+// ---------------------------------------------------------------------------
+const TRACKING_STEP_FIELD_CANDIDATES: Record<string, string[]> = {
+  requested: ["requested_at", "created_at"],
+  accepted: ["accepted_at"],
+  on_the_way: ["on_the_way_at", "started_at", "on_the_way_since"],
+  arrived: ["arrived_at"],
+  completed: ["completed_at", "completed_time"],
+};
+
+function getStepTimestamp(booking: any, key: string): string | null {
+  const fields = TRACKING_STEP_FIELD_CANDIDATES[key] || [];
+  for (const field of fields) {
+    const raw = booking?.[field];
+    if (!raw) continue;
+    const d = new Date(raw);
+    if (!Number.isNaN(d.getTime())) {
+      return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
+  }
+  return null;
+}
+
 const { width, height } = Dimensions.get("window");
 const GOOGLE_MAPS_API_KEY = process.env
   .EXPO_PUBLIC_GOOGLE_MAPS_API_KEY as string;
@@ -222,9 +263,70 @@ if (!GOOGLE_MAPS_API_KEY) {
   console.error("❌ GOOGLE_MAPS_API_KEY is missing! Check your .env file");
 }
 
-const OUTER_RIPPLE_DELAY_SEC = 45;
+// ---------------------------------------------------------------------------
+// ✅ Search timeline (out of the 120s waiting window):
+//   0s  -> 45s : searching within MECHANIC_INNER_RING_KM  (2km)  — teal
+//   45s -> 80s : searching within MECHANIC_MIDDLE_RING_KM (5km)  — amber
+//   80s -> 120s: searching within MECHANIC_OUTER_RING_KM (10km) — purple
+// Each tier gets its own ripple loop, its own solid ring on the map, and
+// its own legend dot — all driven off the SAME showMiddleRing /
+// showOuterRing booleans so nothing can visually disagree.
+// ---------------------------------------------------------------------------
+const MIDDLE_RIPPLE_DELAY_SEC = 45;
+const OUTER_RIPPLE_DELAY_SEC = 80;
+
 const INNER_RIPPLE_DURATION_MS = 2000;
-const OUTER_RIPPLE_DURATION_MS = 2600;
+const MIDDLE_RIPPLE_DURATION_MS = 2600;
+const OUTER_RIPPLE_DURATION_MS = 3200;
+
+// ✅ One color per ring — the legend dots, solid rings, and ripple pulses
+// all pull from here so a color only ever needs to change in one place.
+const RING_COLORS = {
+  inner: {
+    solid: "#063F47",
+    stroke: "rgba(6, 63, 71, 0.6)",
+    fill: "rgba(6, 63, 71, 0.12)",
+    rippleStroke: (o: number) => `rgba(6, 63, 71, ${o * 0.8})`,
+    rippleFill: (o: number) => `rgba(6, 63, 71, ${o * 0.18})`,
+  },
+  middle: {
+    solid: "#D97706",
+    stroke: "rgba(217, 119, 6, 0.55)",
+    fill: "rgba(251, 191, 36, 0.08)",
+    rippleStroke: (o: number) => `rgba(217, 119, 6, ${o * 0.8})`,
+    rippleFill: (o: number) => `rgba(217, 119, 6, ${o * 0.15})`,
+  },
+  outer: {
+    solid: "#7C3AED",
+    stroke: "rgba(124, 58, 237, 0.55)",
+    fill: "rgba(167, 139, 250, 0.08)",
+    rippleStroke: (o: number) => `rgba(124, 58, 237, ${o * 0.8})`,
+    rippleFill: (o: number) => `rgba(124, 58, 237, ${o * 0.15})`,
+  },
+} as const;
+
+// ---------------------------------------------------------------------------
+// ✅ Mechanic marker colors — used by BOTH the waiting/home map pins AND
+// the tracking-screen pin now, so the exact same hard-hat pin shows up
+// everywhere a mechanic is plotted (home map, "Finding a Mechanic" map,
+// and "Mechanic Assigned!" / "Mechanic Has Arrived!" tracking map).
+// ---------------------------------------------------------------------------
+const MECHANIC_PIN_ONLINE = { bg: "#FC6B36", border: "#FFD9C7" };
+const MECHANIC_PIN_OFFLINE = { bg: "#94A3B8", border: "#E2E8F0" };
+
+// ---------------------------------------------------------------------------
+// ✅ Tracking-screen status timeline — mirrors the booking status machine
+// used throughout this file (requested -> accepted -> on_the_way ->
+// arrived -> completed). Shared by the tracking-card timeline UI so the
+// step highlighted there can never disagree with activeBooking.status.
+// ---------------------------------------------------------------------------
+const TRACKING_STEPS: { key: string; label: string }[] = [
+  { key: "requested", label: "Request Confirmed" },
+  { key: "accepted", label: "Mechanic Assigned" },
+  { key: "on_the_way", label: "On The Way" },
+  { key: "arrived", label: "Arrived" },
+  { key: "completed", label: "Completed" },
+];
 
 function calculateDistance(
   lat1: number,
@@ -328,13 +430,20 @@ export default function CustomerScreen() {
   const [weatherLoading, setWeatherLoading] = useState(false);
   const [weatherError, setWeatherError] = useState(false);
 
+  // ✅ One ripple animation per ring (inner 2km / middle 5km / outer 10km).
   const innerRippleAnim = useRef(new Animated.Value(0)).current;
+  const middleRippleAnim = useRef(new Animated.Value(0)).current;
   const outerRippleAnim = useRef(new Animated.Value(0)).current;
   const [innerRippleRadius, setInnerRippleRadius] = useState(0);
   const [innerRippleOpacity, setInnerRippleOpacity] = useState(0);
+  const [middleRippleRadius, setMiddleRippleRadius] = useState(0);
+  const [middleRippleOpacity, setMiddleRippleOpacity] = useState(0);
   const [outerRippleRadius, setOuterRippleRadius] = useState(0);
   const [outerRippleOpacity, setOuterRippleOpacity] = useState(0);
-  const [showOuterRipple, setShowOuterRipple] = useState(false);
+  // showMiddleRing → 5km ring visible; showOuterRing → 10km ring visible.
+  // Inner (2km) ring is always visible while the waiting screen is open.
+  const [showMiddleRing, setShowMiddleRing] = useState(false);
+  const [showOuterRing, setShowOuterRing] = useState(false);
 
   // ✅ Shared UI state pushed up to the Tabs layout so the bottom tab bar
   // itself can swap to a "Book Now" bar — see the sync effect below and
@@ -350,9 +459,25 @@ export default function CustomerScreen() {
   const [homeMapReady, setHomeMapReady] = useState(false);
   const [waitingMapReady, setWaitingMapReady] = useState(false);
 
-  const sheetSnapPoints = useMemo(() => ["43%", "70%", "80%"], []);
+  const sheetSnapPoints = useMemo(() => ["43%", "75%", "80%"], []);
   const locationUpdateInterval = useRef<any>(null);
   const routeRetryCount = useRef(0);
+
+  // ✅ Single derived source of truth for "how wide is the search right
+  // now" — both the map's zoom level (delta) and the km number shown in
+  // the UI are driven off this, so they can never fall out of sync as the
+  // ring expands from 2km → 5km → 10km.
+  const activeWaitingRadiusKm = showOuterRing
+    ? MECHANIC_OUTER_RING_KM
+    : showMiddleRing
+    ? MECHANIC_MIDDLE_RING_KM
+    : MECHANIC_INNER_RING_KM;
+
+  const activeWaitingDelta = useMemo(() => {
+    if (showOuterRing) return WAITING_REGION_DELTA_OUTER;
+    if (showMiddleRing) return WAITING_REGION_DELTA_MIDDLE;
+    return WAITING_REGION_DELTA_INNER;
+  }, [showMiddleRing, showOuterRing]);
 
   useEffect(() => {
     if (chosenService) {
@@ -367,7 +492,26 @@ export default function CustomerScreen() {
     activeBookingRef.current = activeBooking;
   }, [activeBooking]);
 
-  const fetchBookingOTP = async (bookingId: string) => {
+  // ---------------------------------------------------------------------
+  // ✅ FIX — fetchBookingOTP now takes an explicit `openModalIfFound`
+  // flag instead of unconditionally deciding modal visibility itself.
+  // This is what lets us fetch/poll the OTP in the background (e.g. once
+  // the mechanic marks the job "Arrived", so we're ready) WITHOUT that
+  // background fetch popping the "Service Completion" screen on its own.
+  // The modal should only ever appear because of an explicit trigger:
+  //   1) the "otp:generated" socket event (mechanic tapped "Generate
+  //      OTP" / "Complete Service" — see the listener below), or
+  //   2) resuming the app on an "arrived" booking that ALREADY has an
+  //      OTP generated server-side (checkActiveBooking, below), or
+  //   3) the customer manually tapping "Complete Service with OTP" on
+  //      the tracking screen.
+  // In every other case (plain background polling) we only update
+  // `customerOtp` / `isWaitingForOtp` silently.
+  // ---------------------------------------------------------------------
+  const fetchBookingOTP = async (
+    bookingId: string,
+    openModalIfFound: boolean = false,
+  ) => {
     try {
       const response = await api.get(`/bookings/${bookingId}`);
       if (response.data) {
@@ -375,10 +519,13 @@ export default function CustomerScreen() {
           setCustomerOtp(response.data.completion_otp);
           setOtpExpiry(response.data.otp_expires_at ? new Date(response.data.otp_expires_at) : null);
           setIsWaitingForOtp(false);
+          if (openModalIfFound) {
+            setShowOTPModal(true);
+          }
         } else {
           setIsWaitingForOtp(true);
           setCustomerOtp(null);
-          setTimeout(() => fetchBookingOTP(bookingId), 5000);
+          setTimeout(() => fetchBookingOTP(bookingId, openModalIfFound), 5000);
         }
       }
     } catch (error) {
@@ -386,13 +533,42 @@ export default function CustomerScreen() {
     }
   };
 
-  const showRatingFlow = useCallback((bookingId: string) => {
+  // ---------------------------------------------------------------------
+  // ✅ Single, shared "service actually completed" handler. This is now
+  // the ONLY place that opens the rating modal — every code path that
+  // learns the booking reached "completed" (the "booking:status:updated"
+  // socket event, the "service:completed" socket event, or the
+  // customer's own OTP-verify path) routes through this function instead
+  // of duplicating the cleanup logic. That guarantees the rating popup
+  // can never appear except as a direct, single-source reaction to the
+  // booking's status genuinely becoming "completed" — and that every
+  // other piece of in-flight UI (OTP modal/pin, tracking modal, waiting
+  // timer) is always torn down at the same time, so nothing stale can
+  // linger and re-trigger something later.
+  // ---------------------------------------------------------------------
+  const handleBookingCompleted = useCallback((bookingId: string | null | undefined) => {
+    if (!bookingId) return;
     setCompletedBookingId(bookingId);
     setShowRatingModal(true);
+
+    // Tear down every other piece of in-flight state for this booking —
+    // completion supersedes all of it.
     setActiveBooking(null);
     setIsTracking(false);
     setCurrentTrackingModal(null);
+    setWaitingForMechanic(false);
+    setShowOTPModal(false);
+    setCustomerOtp(null);
+    setOtpExpiry(null);
+    setIsWaitingForOtp(false);
+    setMechanicLocation(null);
+    setRouteInfo(null);
+    setRouteError(null);
   }, []);
+
+  const showRatingFlow = useCallback((bookingId: string) => {
+    handleBookingCompleted(bookingId);
+  }, [handleBookingCompleted]);
 
   useEffect(() => {
     const handleBookingAccepted = (data: {
@@ -423,33 +599,52 @@ export default function CustomerScreen() {
       const current = activeBookingRef.current;
       if (!current || updatedBooking?.id !== current.id) return;
 
-      setActiveBooking(updatedBooking);
-
       if (updatedBooking.mechanic?.full_name) {
         setMechanicName(updatedBooking.mechanic.full_name);
       }
 
       if (updatedBooking.status === "on_the_way") {
+        setActiveBooking(updatedBooking);
         Alert.alert("🚗 Mechanic On The Way!");
         setCurrentTrackingModal("tracking");
         setIsTracking(true);
         socketService.requestMechanicLocation(updatedBooking.id);
       } else if (updatedBooking.status === "arrived") {
+        setActiveBooking(updatedBooking);
+        // ---------------------------------------------------------------
+        // ✅ FIX — arriving no longer opens the OTP / "Service
+        // Completion" popup by itself. It only lets the customer know
+        // the mechanic is there and keeps the tracking screen visible.
+        // The popup opens ONLY when the mechanic actually generates a
+        // pin (via the "otp:generated" socket listener registered
+        // below), i.e. once they tap "Generate OTP" or "Complete
+        // Service" on their own dashboard — never just from tapping
+        // "Arrived".
+        // ---------------------------------------------------------------
         Alert.alert(
           "📍 Mechanic Arrived",
-          "Your mechanic has arrived. Please ask them for the OTP code to complete the service.",
+          "Your mechanic has arrived. They'll share a code with you shortly to complete the service.",
         );
-        setShowOTPModal(true);
         setCurrentTrackingModal("tracking");
       } else if (updatedBooking.status === "completed") {
+        // ---------------------------------------------------------------
+        // ✅ FIX — this is THE real completion signal: the mechanic
+        // verified the OTP and the backend/mechanic app explicitly
+        // marked the booking "completed" (see
+        // socketService.updateBookingStatus(bookingId, "completed") in
+        // the mechanic dashboard's verifyMechanicOTP). We route through
+        // the single shared handleBookingCompleted() so the rating
+        // popup — and ONLY the rating popup — appears now, with every
+        // other bit of state (OTP modal, tracking screen, etc.) cleared
+        // at the same time. We intentionally do NOT setActiveBooking
+        // here first; handleBookingCompleted clears it for us.
+        // ---------------------------------------------------------------
         Alert.alert(
           "✅ Service Completed",
           "Thank you for using our service! Please rate your experience.",
         );
-        setCompletedBookingId(updatedBooking?.id);
-        setShowRatingModal(true);
-        setIsTracking(false);
-        setCurrentTrackingModal(null);
+        handleBookingCompleted(updatedBooking.id);
+        loadBookings();
       } else if (updatedBooking.status === "cancelled") {
         Alert.alert("❌ Request Cancelled", "Your request has been cancelled.");
         setActiveBooking(null);
@@ -457,6 +652,8 @@ export default function CustomerScreen() {
         setIsTracking(false);
         setCurrentTrackingModal(null);
         loadBookings();
+      } else {
+        setActiveBooking(updatedBooking);
       }
     };
 
@@ -476,13 +673,44 @@ export default function CustomerScreen() {
             text: "Skip",
             style: "cancel",
             onPress: () => {
+              // ✅ FIX — "Skip" now tears down the same in-flight state
+              // handleBookingCompleted would have (OTP modal/pin,
+              // tracking modal, waiting timer), instead of only clearing
+              // activeBooking/isTracking and leaving OTP state stranded.
               setActiveBooking(null);
               setIsTracking(false);
               setCurrentTrackingModal(null);
+              setWaitingForMechanic(false);
+              setShowOTPModal(false);
+              setCustomerOtp(null);
+              setOtpExpiry(null);
+              setIsWaitingForOtp(false);
             },
           },
         ],
       );
+      loadBookings();
+    };
+
+    // -----------------------------------------------------------------
+    // ✅ NEW — this is the ONE trigger that should open the customer's
+    // "Service Completion" / OTP screen. It fires when the mechanic
+    // explicitly taps "Generate OTP" or "Complete Service" on their
+    // dashboard (see generateOTPForCompletion → socketService
+    // .emitOtpGenerated(...) in the mechanic screen). Marking a job
+    // "Arrived" alone never fires this event, so the popup can never
+    // appear prematurely.
+    // -----------------------------------------------------------------
+    const handleOtpGenerated = (data: {
+      bookingId: string;
+      mechanicId?: string;
+    }) => {
+      const current = activeBookingRef.current;
+      if (!current || data.bookingId !== current.id) return;
+
+      setIsWaitingForOtp(true);
+      setShowOTPModal(true);
+      fetchBookingOTP(data.bookingId, true);
     };
 
     const handleMechanicLocationUpdate = (data: {
@@ -549,12 +777,14 @@ export default function CustomerScreen() {
     socketService.on("booking:accepted", handleBookingAccepted);
     socketService.on("booking:status:updated", handleStatusUpdated);
     socketService.on("service:completed", handleServiceCompleted);
+    socketService.on("otp:generated", handleOtpGenerated);
     socketService.on("mechanic:location:update", handleMechanicLocationUpdate);
 
     return () => {
       socketService.off("booking:accepted", handleBookingAccepted);
       socketService.off("booking:status:updated", handleStatusUpdated);
       socketService.off("service:completed", handleServiceCompleted);
+      socketService.off("otp:generated", handleOtpGenerated);
       socketService.off(
         "mechanic:location:update",
         handleMechanicLocationUpdate,
@@ -567,7 +797,7 @@ export default function CustomerScreen() {
         clearInterval(timerInterval);
       }
     };
-  }, []);
+  }, [handleBookingCompleted, showRatingFlow]);
 
   useEffect(() => {
     if (activeBooking?.id) {
@@ -576,10 +806,21 @@ export default function CustomerScreen() {
     }
   }, [activeBooking?.id]);
 
+  // ---------------------------------------------------------------------
+  // ✅ FIX — this effect used to force `setShowOTPModal(true)` the moment
+  // `activeBooking.status` became "arrived", which is exactly what made
+  // the "Service Completion" popup appear on the customer side as soon
+  // as the mechanic tapped "Arrived" — before any pin had actually been
+  // generated. It now only makes sure we're silently polling for the
+  // OTP in the background (via fetchBookingOTP, openModalIfFound=false)
+  // so `customerOtp`/`isWaitingForOtp` are ready and accurate. The modal
+  // itself only opens from the "otp:generated" socket event above, from
+  // checkActiveBooking finding an OTP already generated on app-resume,
+  // or from the customer manually tapping "Complete Service with OTP".
+  // ---------------------------------------------------------------------
   useEffect(() => {
-    if (activeBooking?.status === "arrived" && activeBooking?.id) {
-      fetchBookingOTP(activeBooking.id);
-      setShowOTPModal(true);
+    if (activeBooking?.status === "arrived" && activeBooking?.id && !customerOtp) {
+      fetchBookingOTP(activeBooking.id, false);
     }
   }, [activeBooking?.status, activeBooking?.id]);
 
@@ -640,6 +881,8 @@ export default function CustomerScreen() {
     return () => clearInterval(interval);
   }, [currentTrackingModal, coords?.latitude, coords?.longitude]);
 
+  // ✅ Inner (2km) ripple — always animating while the waiting screen is
+  // open, same as before.
   useEffect(() => {
     if (currentTrackingModal !== "waiting") return;
 
@@ -667,18 +910,55 @@ export default function CustomerScreen() {
     };
   }, [currentTrackingModal]);
 
+  // ✅ Drives BOTH expansion flags off the same countdown timer that
+  // powers the inner ring, so the 2km → 5km → 10km handoff always lines
+  // up with the "Elapsed time" stat shown on screen.
   useEffect(() => {
     if (currentTrackingModal !== "waiting") {
-      setShowOuterRipple(false);
+      setShowMiddleRing(false);
+      setShowOuterRing(false);
       return;
     }
+    if (timeRemaining <= 120 - MIDDLE_RIPPLE_DELAY_SEC) {
+      setShowMiddleRing(true);
+    }
     if (timeRemaining <= 120 - OUTER_RIPPLE_DELAY_SEC) {
-      setShowOuterRipple(true);
+      setShowOuterRing(true);
     }
   }, [timeRemaining, currentTrackingModal]);
 
+  // ✅ Middle (5km) ripple — same pattern as the inner ripple, just gated
+  // behind showMiddleRing instead of always-on.
   useEffect(() => {
-    if (!showOuterRipple) return;
+    if (!showMiddleRing) return;
+
+    middleRippleAnim.setValue(0);
+    const loop = Animated.loop(
+      Animated.timing(middleRippleAnim, {
+        toValue: 1,
+        duration: MIDDLE_RIPPLE_DURATION_MS,
+        easing: Easing.out(Easing.ease),
+        useNativeDriver: false,
+      }),
+    );
+    loop.start();
+
+    const listenerId = middleRippleAnim.addListener(({ value }) => {
+      setMiddleRippleRadius(MECHANIC_MIDDLE_RING_KM * 1000 * value);
+      setMiddleRippleOpacity(1 - value);
+    });
+
+    return () => {
+      loop.stop();
+      middleRippleAnim.removeListener(listenerId);
+      setMiddleRippleRadius(0);
+      setMiddleRippleOpacity(0);
+    };
+  }, [showMiddleRing]);
+
+  // ✅ Outer (10km) ripple — same pattern again, gated behind showOuterRing.
+  useEffect(() => {
+    if (!showOuterRing) return;
 
     outerRippleAnim.setValue(0);
     const loop = Animated.loop(
@@ -692,7 +972,7 @@ export default function CustomerScreen() {
     loop.start();
 
     const listenerId = outerRippleAnim.addListener(({ value }) => {
-      setOuterRippleRadius(MECHANIC_SEARCH_RADIUS_KM * 1000 * value);
+      setOuterRippleRadius(MECHANIC_OUTER_RING_KM * 1000 * value);
       setOuterRippleOpacity(1 - value);
     });
 
@@ -702,7 +982,7 @@ export default function CustomerScreen() {
       setOuterRippleRadius(0);
       setOuterRippleOpacity(0);
     };
-  }, [showOuterRipple]);
+  }, [showOuterRing]);
 
   useFocusEffect(
     useCallback(() => {
@@ -858,12 +1138,11 @@ export default function CustomerScreen() {
 
   useEffect(() => {
     if (!coords || !waitingMapReady || currentTrackingModal !== "waiting") return;
-    const delta = showOuterRipple ? WAITING_REGION_DELTA : WAITING_REGION_DELTA_INNER;
     waitingMapRef.current?.animateToRegion(
       {
         ...coords,
-        latitudeDelta: delta,
-        longitudeDelta: delta,
+        latitudeDelta: activeWaitingDelta,
+        longitudeDelta: activeWaitingDelta,
       },
       400,
     );
@@ -873,7 +1152,7 @@ export default function CustomerScreen() {
     waitingMapReady,
     currentTrackingModal,
     nearbyMechanics.length,
-    showOuterRipple,
+    activeWaitingDelta,
   ]);
 
   const recenterOnMe = useCallback(async () => {
@@ -882,16 +1161,15 @@ export default function CustomerScreen() {
 
   const recenterWaitingMap = useCallback(() => {
     if (!coords) return;
-    const delta = showOuterRipple ? WAITING_REGION_DELTA : WAITING_REGION_DELTA_INNER;
     waitingMapRef.current?.animateToRegion(
       {
         ...coords,
-        latitudeDelta: delta,
-        longitudeDelta: delta,
+        latitudeDelta: activeWaitingDelta,
+        longitudeDelta: activeWaitingDelta,
       },
       400,
     );
-  }, [coords, showOuterRipple]);
+  }, [coords, activeWaitingDelta]);
 
   const mappableMechanics = useMemo(
     () =>
@@ -911,8 +1189,12 @@ export default function CustomerScreen() {
     [nearbyMechanics],
   );
 
+  // ✅ Only show mechanics that fall inside whichever ring is currently
+  // active (2km, then 5km, then 10km) — same filtering pattern as before,
+  // just parameterized by activeWaitingRadiusKm instead of a single
+  // hardcoded threshold.
   const visibleWaitingMechanics = useMemo(() => {
-    if (showOuterRipple || !coords) return mappableMechanics;
+    if (!coords) return mappableMechanics;
     return mappableMechanics.filter(({ mechanic, coordinate }) => {
       const distanceKm =
         typeof mechanic.distance_km === "number"
@@ -923,9 +1205,10 @@ export default function CustomerScreen() {
               coordinate.latitude,
               coordinate.longitude,
             );
-      return distanceKm <= MECHANIC_INNER_RING_KM;
+      return distanceKm <= activeWaitingRadiusKm;
     });
-  }, [mappableMechanics, showOuterRipple, coords]);
+    
+  }, [mappableMechanics, activeWaitingRadiusKm, coords]);
 
   const quickAccessData = useMemo(
     () =>
@@ -995,6 +1278,13 @@ export default function CustomerScreen() {
     return match?.name || "Service";
   }, [recentBooking, services]);
 
+  // ---------------------------------------------------------------------
+  // ✅ Selecting a service (not deselecting it) automatically opens the
+  // vehicle-type modal if no vehicle has been picked yet. This replaces
+  // the old always-visible inline "Vehicle Type" grid — the vehicle
+  // picker now only appears when it's actually needed, right after the
+  // customer commits to a service.
+  // ---------------------------------------------------------------------
   const handleQuickAccessPress = useCallback(
     (qa: (typeof quickAccessData)[number]) => {
       if (!qa.available) {
@@ -1011,37 +1301,55 @@ export default function CustomerScreen() {
         );
         return;
       }
-      setChosenService((prev) =>
-        prev?.id === qa.service!.id ? null : qa.service!,
-      );
+
+      const wasSelected = chosenService?.id === qa.service.id;
+      setChosenService(wasSelected ? null : qa.service);
+
+      if (!wasSelected && !selectedVehicle) {
+        setShowVehicleListModal(true);
+      }
     },
-    [],
+    [chosenService, selectedVehicle],
   );
 
-  const handleServiceModalSelect = useCallback((service: ServiceItem) => {
-    if (!isServiceAvailable(service.name)) {
-      Alert.alert(
-        "Service Unavailable",
-        `${service.name} isn't available for booking right now.`,
-      );
-      return;
-    }
-    setChosenService((prev) => (prev?.id === service.id ? null : service));
-    setShowServiceListModal(false);
-  }, []);
+  const handleServiceModalSelect = useCallback(
+    (service: ServiceItem) => {
+      if (!isServiceAvailable(service.name)) {
+        Alert.alert(
+          "Service Unavailable",
+          `${service.name} isn't available for booking right now.`,
+        );
+        return;
+      }
+
+      const wasSelected = chosenService?.id === service.id;
+      setChosenService(wasSelected ? null : service);
+      setShowServiceListModal(false);
+
+      if (!wasSelected && !selectedVehicle) {
+        setShowVehicleListModal(true);
+      }
+    },
+    [chosenService, selectedVehicle],
+  );
 
   // ---------------------------------------------------------------------
-  // ✅ FIX — vehicle selection now TOGGLES. Tapping the already-selected
-  // vehicle again deselects it (sets selectedVehicle back to null), same
-  // pattern as service selection (handleQuickAccessPress /
-  // handleServiceModalSelect above). Tapping a different vehicle still
-  // requires a location first, same as before.
+  // ✅ FIX — vehicle selection TOGGLES, and deselecting a vehicle (by any
+  // route — tapping the already-selected vehicle again here, OR tapping
+  // the dustbin/delete button on the "selected vehicle" card) now ALWAYS
+  // clears the chosen service too. Previously, tapping the same vehicle
+  // again to unselect it only cleared `selectedVehicle`, leaving
+  // `chosenService` (and therefore `canBookNow`) still set — so "Book
+  // Now" could remain active with no vehicle chosen. Both deselect paths
+  // now go through the same clearing logic so they can never disagree.
   // ---------------------------------------------------------------------
   const handleVehicleSelect = useCallback(
     (vt: VehicleType) => {
-      // Tapping the already-selected vehicle again unselects it.
+      // Tapping the already-selected vehicle again unselects it — and
+      // clears the chosen service along with it.
       if (selectedVehicle?.id === vt.id) {
         setSelectedVehicle(null);
+        setChosenService(null);
         return;
       }
 
@@ -1060,6 +1368,21 @@ export default function CustomerScreen() {
     },
     [selectedLocation, coords, selectedVehicle],
   );
+
+  // ---------------------------------------------------------------------
+  // ✅ Clears the selected vehicle AND the chosen service together.
+  // Wired to the dustbin (delete) button on the "selected vehicle" card
+  // below. Clearing selectedVehicle automatically hides the whole
+  // "Vehicle Type" section (it's already gated on `selectedVehicle &&`
+  // in the render), and clearing chosenService puts the "Choose a
+  // Service" quick-access grid back to its unselected state (isSelected
+  // there is derived from chosenService?.id, so no separate reset is
+  // needed).
+  // ---------------------------------------------------------------------
+  const handleRemoveVehicleSelection = useCallback(() => {
+    setSelectedVehicle(null);
+    setChosenService(null);
+  }, []);
 
   const fetchCurrentLocation = async () => {
     try {
@@ -1130,8 +1453,19 @@ export default function CustomerScreen() {
             }, 1000);
           }
 
+          // -----------------------------------------------------------
+          // ✅ FIX — resuming into an "arrived" booking no longer force
+          // -opens the OTP modal. We only fetch the OTP, and pass
+          // openModalIfFound=true so the modal appears ONLY if the
+          // mechanic had already generated a pin before the app was
+          // reopened (in which case popping it back up is correct — the
+          // customer was already meant to see it). If no pin has been
+          // generated yet, this just starts the silent background poll
+          // and the modal stays closed until "otp:generated" fires or
+          // one shows up.
+          // -----------------------------------------------------------
           if (active.status === "arrived") {
-            setShowOTPModal(true);
+            fetchBookingOTP(active.id, true);
           }
         } else if (active.status === "requested") {
           setWaitingForMechanic(true);
@@ -1213,6 +1547,8 @@ export default function CustomerScreen() {
           radiusKm: MECHANIC_SEARCH_RADIUS_KM,
         },
       });
+      console.log("🔧 /mechanics/nearby raw response:", JSON.stringify(data));
+    console.log("🔧 mechanic count from API:", data?.length ?? 0);
       setNearbyMechanics(data || []);
     } catch (error) {
       console.error("Failed to fetch mechanics for map:", error);
@@ -1395,6 +1731,17 @@ export default function CustomerScreen() {
     }
   }
 
+  // ---------------------------------------------------------------------
+  // ✅ NOTE — this customer-side verify function is intentionally NOT
+  // wired to any button in the UI. Per the product flow, the CUSTOMER
+  // never types the OTP — the MECHANIC does (they read it back from the
+  // customer and enter it in their own app; see verifyMechanicOTP in the
+  // mechanic dashboard). This is kept only in case a future "customer
+  // self-serve" entry point is added, and if it ever runs it now routes
+  // completion through the same handleBookingCompleted() used
+  // everywhere else, so the rating popup can never appear through two
+  // different code paths with two different cleanup behaviors.
+  // ---------------------------------------------------------------------
   async function handleVerifyOTP() {
     if (!otpCode || otpCode.length !== 6) {
       Alert.alert("Error", "Please enter the 6-digit OTP code");
@@ -1411,35 +1758,17 @@ export default function CustomerScreen() {
       );
 
       if (response.data.success) {
-        socketService.emitOtpVerified(activeBookingRef.current?.id);
-        setShowOTPModal(false);
+        const bookingId = activeBookingRef.current?.id;
+        socketService.emitOtpVerified(bookingId);
+        socketService.updateBookingStatus(bookingId, "completed");
         setOtpCode("");
 
         Alert.alert(
           "✓ Service Completed!",
           "Thank you for using our service! Please rate your experience.",
-          [
-            {
-              text: "Rate Now",
-              onPress: () => showRatingFlow(activeBookingRef.current?.id),
-            },
-            {
-              text: "Skip",
-              style: "cancel",
-              onPress: () => {
-                setCompletedBookingId(null);
-                setShowRatingModal(false);
-                setActiveBooking(null);
-                setIsTracking(false);
-                setCurrentTrackingModal(null);
-              },
-            },
-          ],
         );
 
-        setActiveBooking((prev: any) => ({ ...prev, status: "completed" }));
-        setIsTracking(false);
-        setCurrentTrackingModal(null);
+        handleBookingCompleted(bookingId);
         await loadBookings();
       }
     } catch (error: any) {
@@ -1543,14 +1872,11 @@ export default function CustomerScreen() {
       onRequestClose={cancelActiveBooking}
       onShow={() => {
         if (coords) {
-          const delta = showOuterRipple
-            ? WAITING_REGION_DELTA
-            : WAITING_REGION_DELTA_INNER;
           waitingMapRef.current?.animateToRegion(
             {
               ...coords,
-              latitudeDelta: delta,
-              longitudeDelta: delta,
+              latitudeDelta: activeWaitingDelta,
+              longitudeDelta: activeWaitingDelta,
             },
             0,
           );
@@ -1621,21 +1947,39 @@ export default function CustomerScreen() {
                 rotateEnabled={false}
                 pitchEnabled={false}
               >
-                {showOuterRipple && (
+                {/*
+                  ✅ Rings are drawn widest-first (10km → 5km → 2km) so the
+                  smaller, more "active" rings always render on top of the
+                  wider ones. Each ring only mounts once its tier is
+                  reached, exactly mirroring how the original 5km ring
+                  used to gate on showOuterRipple.
+                */}
+                {showOuterRing && (
                   <Circle
                     center={coords}
-                    radius={MECHANIC_SEARCH_RADIUS_KM * 1000}
+                    radius={MECHANIC_OUTER_RING_KM * 1000}
                     strokeWidth={1.5}
-                    strokeColor="rgba(217, 119, 6, 0.55)"
-                    fillColor="rgba(251, 191, 36, 0.08)"
+                    strokeColor={RING_COLORS.outer.stroke}
+                    fillColor={RING_COLORS.outer.fill}
                   />
                 )}
+
+                {showMiddleRing && (
+                  <Circle
+                    center={coords}
+                    radius={MECHANIC_MIDDLE_RING_KM * 1000}
+                    strokeWidth={1.5}
+                    strokeColor={RING_COLORS.middle.stroke}
+                    fillColor={RING_COLORS.middle.fill}
+                  />
+                )}
+
                 <Circle
                   center={coords}
                   radius={MECHANIC_INNER_RING_KM * 1000}
                   strokeWidth={1.5}
-                  strokeColor="rgba(6, 63, 71, 0.6)"
-                  fillColor="rgba(6, 63, 71, 0.12)"
+                  strokeColor={RING_COLORS.inner.stroke}
+                  fillColor={RING_COLORS.inner.fill}
                 />
 
                 {innerRippleOpacity > 0 && (
@@ -1643,18 +1987,28 @@ export default function CustomerScreen() {
                     center={coords}
                     radius={innerRippleRadius}
                     strokeWidth={2}
-                    strokeColor={`rgba(6, 63, 71, ${innerRippleOpacity * 0.8})`}
-                    fillColor={`rgba(6, 63, 71, ${innerRippleOpacity * 0.18})`}
+                    strokeColor={RING_COLORS.inner.rippleStroke(innerRippleOpacity)}
+                    fillColor={RING_COLORS.inner.rippleFill(innerRippleOpacity)}
                   />
                 )}
 
-                {showOuterRipple && outerRippleOpacity > 0 && (
+                {showMiddleRing && middleRippleOpacity > 0 && (
+                  <Circle
+                    center={coords}
+                    radius={middleRippleRadius}
+                    strokeWidth={2}
+                    strokeColor={RING_COLORS.middle.rippleStroke(middleRippleOpacity)}
+                    fillColor={RING_COLORS.middle.rippleFill(middleRippleOpacity)}
+                  />
+                )}
+
+                {showOuterRing && outerRippleOpacity > 0 && (
                   <Circle
                     center={coords}
                     radius={outerRippleRadius}
                     strokeWidth={2}
-                    strokeColor={`rgba(217, 119, 6, ${outerRippleOpacity * 0.8})`}
-                    fillColor={`rgba(217, 119, 6, ${outerRippleOpacity * 0.15})`}
+                    strokeColor={RING_COLORS.outer.rippleStroke(outerRippleOpacity)}
+                    fillColor={RING_COLORS.outer.rippleFill(outerRippleOpacity)}
                   />
                 )}
 
@@ -1670,11 +2024,11 @@ export default function CustomerScreen() {
                         styles.mechanicMarkerPin,
                         {
                           backgroundColor: mechanic.is_online
-                            ? "#FC6B36"
-                            : "#94A3B8",
+                            ? MECHANIC_PIN_ONLINE.bg
+                            : MECHANIC_PIN_OFFLINE.bg,
                           borderColor: mechanic.is_online
-                            ? "#FFD9C7"
-                            : "#E2E8F0",
+                            ? MECHANIC_PIN_ONLINE.border
+                            : MECHANIC_PIN_OFFLINE.border,
                         },
                       ]}
                     >
@@ -1689,8 +2043,8 @@ export default function CustomerScreen() {
                         styles.mechanicMarkerPointer,
                         {
                           borderTopColor: mechanic.is_online
-                            ? "#FC6B36"
-                            : "#94A3B8",
+                            ? MECHANIC_PIN_ONLINE.bg
+                            : MECHANIC_PIN_OFFLINE.bg,
                         },
                       ]}
                     />
@@ -1718,19 +2072,29 @@ export default function CustomerScreen() {
               <View style={styles.radiusLegend}>
                 <View style={styles.radiusLegendRow}>
                   <View
-                    style={[styles.radiusLegendDot, { backgroundColor: "#063F47" }]}
+                    style={[styles.radiusLegendDot, { backgroundColor: RING_COLORS.inner.solid }]}
                   />
                   <Text style={styles.radiusLegendText}>
                     {MECHANIC_INNER_RING_KM} km
                   </Text>
                 </View>
-                {showOuterRipple && (
+                {showMiddleRing && (
                   <View style={styles.radiusLegendRow}>
                     <View
-                      style={[styles.radiusLegendDot, { backgroundColor: "#D97706" }]}
+                      style={[styles.radiusLegendDot, { backgroundColor: RING_COLORS.middle.solid }]}
                     />
                     <Text style={styles.radiusLegendText}>
-                      {MECHANIC_SEARCH_RADIUS_KM} km
+                      {MECHANIC_MIDDLE_RING_KM} km
+                    </Text>
+                  </View>
+                )}
+                {showOuterRing && (
+                  <View style={styles.radiusLegendRow}>
+                    <View
+                      style={[styles.radiusLegendDot, { backgroundColor: RING_COLORS.outer.solid }]}
+                    />
+                    <Text style={styles.radiusLegendText}>
+                      {MECHANIC_OUTER_RING_KM} km
                     </Text>
                   </View>
                 )}
@@ -1773,8 +2137,10 @@ export default function CustomerScreen() {
                 <View style={styles.waitingHeaderTextWrap}>
                   <Text style={styles.waitingHeaderTitle}>Finding a Mechanic</Text>
                   <Text style={styles.waitingHeaderSubtitle} numberOfLines={1}>
-                    {showOuterRipple
-                      ? `Searching for available mechanics within ${MECHANIC_SEARCH_RADIUS_KM}km`
+                    {showOuterRing
+                      ? `Searching for available mechanics within ${MECHANIC_OUTER_RING_KM}km`
+                      : showMiddleRing
+                      ? `Searching for available mechanics within ${MECHANIC_MIDDLE_RING_KM}km`
                       : `Sending request to mechanics within ${MECHANIC_INNER_RING_KM}km first`}
                   </Text>
                 </View>
@@ -1825,7 +2191,7 @@ export default function CustomerScreen() {
                     <Ionicons name="radio-outline" size={16} color="#063F47" />
                   </View>
                   <Text style={styles.statValue}>
-                    {showOuterRipple ? MECHANIC_SEARCH_RADIUS_KM : MECHANIC_INNER_RING_KM} km
+                    {activeWaitingRadiusKm} km
                   </Text>
                   <Text style={styles.statLabel} numberOfLines={1}>Current radius</Text>
                 </View>
@@ -1844,13 +2210,17 @@ export default function CustomerScreen() {
                 <Ionicons name="information-circle-outline" size={18} color="#64748B" />
                 <View style={styles.expandNoticeTextWrap}>
                   <Text style={styles.expandNoticeTitle}>
-                    {showOuterRipple
-                      ? `Searching within ${MECHANIC_SEARCH_RADIUS_KM}km radius`
+                    {showOuterRing
+                      ? `Searching within ${MECHANIC_OUTER_RING_KM}km radius`
+                      : showMiddleRing
+                      ? `No mechanic found in ${MECHANIC_MIDDLE_RING_KM}km?`
                       : `No mechanic found in ${MECHANIC_INNER_RING_KM}km?`}
                   </Text>
-                  {!showOuterRipple && (
+                  {!showOuterRing && (
                     <Text style={styles.expandNoticeSubtitle}>
-                      We'll automatically expand to {MECHANIC_SEARCH_RADIUS_KM}km radius.
+                      {showMiddleRing
+                        ? `We'll automatically expand to ${MECHANIC_OUTER_RING_KM}km radius.`
+                        : `We'll automatically expand to ${MECHANIC_MIDDLE_RING_KM}km radius.`}
                     </Text>
                   )}
                 </View>
@@ -1894,6 +2264,49 @@ export default function CustomerScreen() {
     </Modal>
   );
 
+  // ---------------------------------------------------------------------
+  // ✅ TRACKING SCREEN — redesigned info card.
+  // Layout mirrors the reference design: an ETA hero row, a mechanic
+  // profile row with a call button, a vehicle/service summary row, and a
+  // vertical status timeline with per-step timestamps (requested is
+  // always shown as done here since this screen only renders once the
+  // booking has passed that stage). The map above still shows the exact
+  // same pins as before — service-location pin + mechanic pin (amber) +
+  // live route — with two changes:
+  //
+  //   ✅ FIX — the destination ("Mechanic Assigned" service-location) pin
+  //   now uses the SAME <UserLocationMarker /> component used for the
+  //   customer's current-location pin on the "Finding a Mechanic" waiting
+  //   screen and on the home map, instead of the old one-off blue
+  //   location-pin View (styles.serviceLocationMarker). This is the exact
+  //   same locator pin everywhere the customer's location is plotted.
+  //
+  //   ✅ FIX — the mechanic pin on this screen now uses the SAME
+  //   hard-hat "pin + pointer" marker (mechanicMarkerPin /
+  //   mechanicMarkerPointer, colored with MECHANIC_PIN_ONLINE) as the
+  //   "Finding a Mechanic" waiting screen and the home map, instead of
+  //   the old plain car-in-a-circle. This one marker style is now used
+  //   for every stage — Mechanic Assigned, On The Way, and Arrived —
+  //   since they all render through this same function.
+  //
+  //   ✅ NEW — a Rapido-style dashed straight-line connector
+  //   (react-native-maps' <Polyline>) is drawn directly between the
+  //   mechanic pin and the destination pin. It renders immediately
+  //   (as soon as both coordinates are known), so there's always a
+  //   visible link between the two points even before the real
+  //   MapViewDirections road route has loaded. Once the actual driving
+  //   route comes back, the solid green route line renders on top of
+  //   it, giving the same "straight connector + real route overlaid"
+  //   look Rapido/Ola/Uber use to show how much distance the vehicle
+  //   still has to cover.
+  //
+  //   ✅ FIX — the ETA hero row and the mechanic profile row have been
+  //   merged into ONE single card (`mechanicEtaCard`): the mechanic's
+  //   avatar/name/rating/call button sit on top, a thin divider
+  //   separates it from an "Arriving in / mechanic has arrived" strip
+  //   underneath — one section instead of two separate cards stacked
+  //   with a gap between them.
+  // ---------------------------------------------------------------------
   const renderTrackingScreen = () => {
     if (
       currentTrackingModal !== "tracking" ||
@@ -1923,10 +2336,44 @@ export default function CustomerScreen() {
     const displayMechanicName =
       mechanicName || activeBooking?.mechanic?.full_name || "Mechanic";
 
+    const mechanicPhone =
+      activeBooking?.mechanic?.phone_number ||
+      activeBooking?.mechanic?.phone ||
+      activeBooking?.mechanic?.mobile ||
+      null;
+
+    const mechanicRating =
+      typeof activeBooking?.mechanic?.rating === "number"
+        ? activeBooking.mechanic.rating
+        : null;
+
     const canShowDirections =
       GOOGLE_MAPS_API_KEY &&
       GOOGLE_MAPS_API_KEY !== "your_api_key_here" &&
       GOOGLE_MAPS_API_KEY.length > 10;
+
+    const currentStepIndex = TRACKING_STEPS.findIndex(
+      (s) => s.key === activeBooking.status,
+    );
+
+    const etaHeadline =
+      activeBooking.status === "arrived"
+        ? "Mechanic has arrived"
+        : "Arriving in";
+
+    const etaValue =
+      activeBooking.status === "arrived"
+        ? null
+        : routeInfo?.durationText ||
+          (distance !== null
+            ? distance < 1
+              ? "2-3 min"
+              : `~${Math.round(distance * 2)} min`
+            : "Calculating…");
+
+    const vehicleIcon = iconForVehicleCategory(
+      selectedVehicle?.category || activeBooking?.vehicle_type,
+    );
 
     return (
       <Modal
@@ -1950,11 +2397,11 @@ export default function CustomerScreen() {
                 onPress={cancelActiveBooking}
                 style={styles.trackingCancelButton}
               >
-                <Ionicons name="close" size={24} color="#EF4444" />
+                <Ionicons name="close" size={22} color="#EF4444" />
               </TouchableOpacity>
             </View>
 
-            <View style={styles.mapContainer}>
+            <View style={[styles.mapContainer, styles.trackingMapContainer]}>
               {hasValidLocations ? (
                 <MapView
                   ref={mapRef}
@@ -1995,24 +2442,68 @@ export default function CustomerScreen() {
                     }, 500);
                   }}
                 >
-                  <Marker coordinate={destination} pinColor="#3B82F6">
-                    <View style={styles.serviceLocationMarker}>
-                      <Ionicons name="location" size={20} color="#FFF" />
-                    </View>
-                    <Callout>
-                      <Text style={styles.calloutText}>Service Location</Text>
-                      {serviceLocation?.address ? (
-                        <Text style={styles.calloutAddress}>
-                          {serviceLocation.address}
-                        </Text>
-                      ) : null}
-                    </Callout>
-                  </Marker>
+                  {/*
+                    ✅ NEW — Rapido-style dashed "as the crow flies"
+                    connector between the mechanic and the destination.
+                    Drawn UNDER the real route (declared before it, and
+                    also visually thinner/lighter), so as soon as
+                    MapViewDirections resolves, the solid green route
+                    line sits on top of this dashed guide — exactly the
+                    "line shows how much ground is covered" look from
+                    Rapido. Always visible whenever both points are
+                    known, so the connection is never missing while the
+                    real route is still loading.
+                  */}
+                  <Polyline
+                    coordinates={[mechanicLocation, destination]}
+                    strokeColor="#94A3B8"
+                    strokeWidth={2}
+                    lineDashPattern={[8, 6]}
+                    zIndex={1}
+                  />
 
-                  <Marker coordinate={mechanicLocation} pinColor="#F59E0B">
-                    <View style={styles.trackingMechanicMarker}>
-                      <Ionicons name="car" size={20} color="#FFF" />
+                  {/*
+                    ✅ FIX — same locator pin used for the customer's
+                    current location everywhere else in this file
+                    (waiting-screen map + home map): <UserLocationMarker />.
+                    Previously this was a one-off blue circle
+                    (styles.serviceLocationMarker) that didn't match the
+                    pin shown anywhere else.
+                  */}
+                  <UserLocationMarker coordinate={destination} />
+
+                  {/*
+                    ✅ FIX — same hard-hat pin + pointer marker used on
+                    the "Finding a Mechanic" map and the home map
+                    (styles.mechanicMarkerPin / mechanicMarkerPointer),
+                    instead of the old plain car-in-a-circle
+                    (trackingMechanicMarker). This is the ONE marker
+                    style used for Mechanic Assigned, On The Way, and
+                    Arrived, since all three statuses render through
+                    this same function.
+                  */}
+                  <Marker coordinate={mechanicLocation}>
+                    <View
+                      style={[
+                        styles.mechanicMarkerPin,
+                        {
+                          backgroundColor: MECHANIC_PIN_ONLINE.bg,
+                          borderColor: MECHANIC_PIN_ONLINE.border,
+                        },
+                      ]}
+                    >
+                      <MaterialCommunityIcons
+                        name="account-hard-hat"
+                        size={22}
+                        color="#FFFFFF"
+                      />
                     </View>
+                    <View
+                      style={[
+                        styles.mechanicMarkerPointer,
+                        { borderTopColor: MECHANIC_PIN_ONLINE.bg },
+                      ]}
+                    />
                     <Callout>
                       <Text style={styles.calloutText}>
                         {displayMechanicName}
@@ -2106,124 +2597,281 @@ export default function CustomerScreen() {
               )}
             </View>
 
-            <View
-              style={[
-                styles.trackingInfoCard,
-                {
-                  paddingBottom:
-                    Math.max(20, insets.bottom + 20) +
-                    (Platform.OS === "android" ? 24 : 0),
-                },
-              ]}
-            >
-              <View style={styles.trackingInfoRow}>
-                <Ionicons name="location" size={20} color="#64748B" />
-                <Text style={styles.trackingInfoLabel}>Service Location:</Text>
-                <Text style={styles.trackingInfoValue} numberOfLines={1}>
-                  {serviceLocation?.address || "Service Location"}
-                </Text>
-              </View>
+            <View style={styles.trackingInfoCard}>
+              <ScrollView
+                style={styles.trackingInfoScroll}
+                contentContainerStyle={[
+                  styles.trackingInfoScrollContent,
+                  {
+                    paddingBottom:
+                      Math.max(16, insets.bottom + 16) +
+                      (Platform.OS === "android" ? 20 : 0),
+                  },
+                ]}
+                showsVerticalScrollIndicator={false}
+              >
+                {/*
+                  ✅ Mechanic + ETA — merged into a SINGLE section: the
+                  mechanic's avatar/name/rating/call button on top, a
+                  thin divider, then an "Arriving in ..." /
+                  "Mechanic has arrived" strip directly underneath —
+                  one card instead of two.
+                */}
+                <View style={styles.mechanicEtaCard}>
+                  <View style={styles.mechanicEtaTopRow}>
+                    <View style={styles.mechanicAvatar2}>
+                      <Ionicons name="person" size={18} color="#FFF" />
+                    </View>
+                    <View style={styles.mechanicTextWrap2}>
+                      <Text style={styles.mechanicNameText2} numberOfLines={1}>
+                        {displayMechanicName}
+                      </Text>
+                      <View style={styles.mechanicRoleRatingRow}>
+                        <Text style={styles.mechanicRoleText2}>
+                          Expert Mechanic
+                        </Text>
+                        {mechanicRating !== null && (
+                          <>
+                            <Ionicons
+                              name="star"
+                              size={10}
+                              color="#FBBF24"
+                              style={styles.mechanicRatingIcon}
+                            />
+                            <Text style={styles.mechanicRatingText}>
+                              {mechanicRating.toFixed(1)}
+                            </Text>
+                          </>
+                        )}
+                      </View>
+                    </View>
+                    {/*
+                      ✅ FIX — the call button is now ALWAYS rendered in
+                      this corner of the mechanic card (previously it was
+                      hidden completely whenever mechanicPhone was
+                      missing/not yet loaded, which is why it wasn't
+                      showing up next to the name). If a number is
+                      available it dials it directly; otherwise it still
+                      shows (dimmed) and lets the customer know the
+                      number isn't available yet instead of silently
+                      disappearing.
+                    */}
+                    <TouchableOpacity
+                      style={[
+                        styles.callButton2,
+                        !mechanicPhone && styles.callButton2Disabled,
+                      ]}
+                      onPress={() => {
+                        if (mechanicPhone) {
+                          Linking.openURL(`tel:${mechanicPhone}`);
+                        } else {
+                          Alert.alert(
+                            "Number unavailable",
+                            "Your mechanic's phone number isn't available yet.",
+                          );
+                        }
+                      }}
+                      accessibilityLabel="Call mechanic"
+                    >
+                      <Ionicons
+                        name="call"
+                        size={16}
+                        color={mechanicPhone ? "#063F47" : "#94A3B8"}
+                      />
+                    </TouchableOpacity>
+                  </View>
 
-              <View style={styles.trackingInfoRow}>
-                <Ionicons name="person" size={20} color="#64748B" />
-                <Text style={styles.trackingInfoLabel}>Mechanic:</Text>
-                <Text style={styles.trackingInfoValue}>
-                  {displayMechanicName}
-                </Text>
-              </View>
+                  <View style={styles.mechanicEtaDivider} />
 
-              <View style={styles.trackingInfoRow}>
-                <Ionicons name="time" size={20} color="#64748B" />
-                <Text style={styles.trackingInfoLabel}>Status:</Text>
-                <Text style={[styles.trackingInfoValue, styles.statusValue]}>
-                  {activeBooking.status?.replace("_", " ").toUpperCase()}
-                </Text>
-              </View>
+                  <View style={styles.mechanicEtaBottomRow}>
+                    <View style={styles.etaRing}>
+                      <Ionicons
+                        name={
+                          activeBooking.status === "arrived"
+                            ? "location"
+                            : "navigate"
+                        }
+                        size={16}
+                        color="#063F47"
+                      />
+                    </View>
+                    <Text style={styles.etaLabel}>{etaHeadline}</Text>
+                    {etaValue ? (
+                      <Text
+                        style={styles.etaValueText}
+                        numberOfLines={1}
+                      >
+                        {etaValue}
+                      </Text>
+                    ) : null}
+                  </View>
+                </View>
 
-              {routeInfo && routeInfo.duration > 0 ? (
-                <>
-                  <View style={styles.trackingInfoRow}>
-                    <Ionicons name="car" size={20} color="#64748B" />
-                    <Text style={styles.trackingInfoLabel}>ETA:</Text>
-                    <Text style={[styles.trackingInfoValue, styles.etaValue]}>
-                      {routeInfo.durationText}
-                    </Text>
+                {/* Vehicle + service row */}
+                {(selectedVehicle || selectedService) && (
+                  <View style={styles.vehicleCard2}>
+                    <View style={styles.vehicleIconWrap2}>
+                      {vehicleIcon.lib === "FontAwesome5" ? (
+                        <FontAwesome5
+                          name={vehicleIcon.name}
+                          size={14}
+                          color="#EA580C"
+                        />
+                      ) : vehicleIcon.lib === "MaterialCommunityIcons" ? (
+                        <MaterialCommunityIcons
+                          name={vehicleIcon.name as any}
+                          size={18}
+                          color="#EA580C"
+                        />
+                      ) : (
+                        <Ionicons
+                          name={vehicleIcon.name as any}
+                          size={18}
+                          color="#EA580C"
+                        />
+                      )}
+                    </View>
+                    <View style={styles.vehicleTextWrap2}>
+                      <Text style={styles.vehicleNameText2} numberOfLines={1}>
+                        {selectedVehicle?.name || "Your Vehicle"}
+                      </Text>
+                      <Text style={styles.vehicleSubText2} numberOfLines={1}>
+                        {selectedService?.name || "Service"}
+                      </Text>
+                    </View>
+                    {selectedServicePrice != null && (
+                      <Text style={styles.vehiclePriceText2}>
+                        ₹{Math.round(selectedServicePrice)}
+                      </Text>
+                    )}
                   </View>
-                  <View style={styles.trackingInfoRow}>
-                    <Ionicons name="navigate" size={20} color="#64748B" />
-                    <Text style={styles.trackingInfoLabel}>Distance:</Text>
-                    <Text style={styles.trackingInfoValue}>
-                      {routeInfo.distanceText}
-                    </Text>
-                  </View>
-                </>
-              ) : distance !== null && distance > 0 ? (
-                <>
-                  <View style={styles.trackingInfoRow}>
-                    <Ionicons name="location" size={20} color="#64748B" />
-                    <Text style={styles.trackingInfoLabel}>Distance:</Text>
-                    <Text style={styles.trackingInfoValue}>
-                      {distance < 1
-                        ? `${Math.round(distance * 1000)}m`
-                        : `${distance.toFixed(1)}km`}
-                    </Text>
-                  </View>
-                  <View style={styles.trackingInfoRow}>
-                    <Ionicons name="car" size={20} color="#64748B" />
-                    <Text style={styles.trackingInfoLabel}>Est. ETA:</Text>
-                    <Text style={styles.trackingInfoValue}>
-                      {distance < 1
-                        ? "2-3 min"
-                        : `~${Math.round(distance * 2)} min`}
-                    </Text>
-                  </View>
-                  {routeError ? (
-                    <Text style={styles.routeErrorText}>
-                      Using estimated ETA (GPS only)
-                    </Text>
-                  ) : null}
-                </>
-              ) : (
-                <View style={styles.trackingInfoRow}>
-                  <ActivityIndicator size="small" color="#64748B" />
-                  <Text style={styles.trackingInfoLabel}>
-                    Calculating route...
+                )}
+
+                {/* Address */}
+                <View style={styles.addressRow2}>
+                  <Ionicons name="location-outline" size={14} color="#64748B" />
+                  <Text style={styles.addressText2} numberOfLines={2}>
+                    {serviceLocation?.address || "Service Location"}
                   </Text>
                 </View>
-              )}
 
-              {/* ✅ Price of the service being tracked */}
-              {selectedServicePrice != null && (
-                <View style={styles.trackingInfoRow}>
-                  <Ionicons name="pricetag" size={20} color="#64748B" />
-                  <Text style={styles.trackingInfoLabel}>Price:</Text>
-                  <Text style={[styles.trackingInfoValue, styles.priceValue]}>
-                    ₹{Math.round(selectedServicePrice)}
+                {routeError && distance !== null ? (
+                  <Text style={styles.routeErrorText}>
+                    Using estimated ETA (GPS only)
                   </Text>
+                ) : null}
+
+                {/*
+                  ✅ NEW — while the mechanic is on-site but hasn't yet
+                  generated a pin, show a small inline status strip
+                  instead of any modal. This keeps the customer informed
+                  without popping the "Service Completion" screen — that
+                  screen only opens once "otp:generated" actually fires.
+                */}
+                {activeBooking.status === "arrived" && !customerOtp && (
+                  <View style={styles.awaitingOtpStrip}>
+                    <ActivityIndicator size="small" color="#D97706" />
+                    <Text style={styles.awaitingOtpStripText}>
+                      Waiting for your mechanic to share the completion code…
+                    </Text>
+                  </View>
+                )}
+
+                {/* Status timeline */}
+                <View style={styles.timelineCard}>
+                  {TRACKING_STEPS.map((step, idx) => {
+                    const isDone =
+                      idx <= currentStepIndex || step.key === "requested";
+                    const isLast = idx === TRACKING_STEPS.length - 1;
+                    const timestamp = getStepTimestamp(
+                      activeBooking,
+                      step.key,
+                    );
+
+                    return (
+                      <View key={step.key} style={styles.timelineRow}>
+                        <View style={styles.timelineLeftCol}>
+                          <View
+                            style={[
+                              styles.timelineDot,
+                              isDone && styles.timelineDotDone,
+                            ]}
+                          >
+                            {isDone && (
+                              <Ionicons
+                                name="checkmark"
+                                size={10}
+                                color="#FFF"
+                              />
+                            )}
+                          </View>
+                          {!isLast && (
+                            <View
+                              style={[
+                                styles.timelineLine,
+                                idx < currentStepIndex &&
+                                  styles.timelineLineDone,
+                              ]}
+                            />
+                          )}
+                        </View>
+                        <View
+                          style={[
+                            styles.timelineRightCol,
+                            isLast && styles.timelineRightColLast,
+                          ]}
+                        >
+                          <Text
+                            style={[
+                              styles.timelineLabel,
+                              isDone && styles.timelineLabelDone,
+                            ]}
+                            numberOfLines={1}
+                          >
+                            {step.label}
+                          </Text>
+                          <Text style={styles.timelineTime}>
+                            {timestamp || (isDone ? "" : "—")}
+                          </Text>
+                        </View>
+                      </View>
+                    );
+                  })}
                 </View>
-              )}
 
-              {activeBooking.status === "arrived" && (
-                <TouchableOpacity
-                  style={styles.completeButton}
-                  onPress={() => setShowOTPModal(true)}
-                >
-                  <Text style={styles.completeButtonText}>
-                    Complete Service with OTP
-                  </Text>
-                </TouchableOpacity>
-              )}
+                {/*
+                  ✅ FIX — this button is a deliberate, customer-initiated
+                  action ("let me check the code myself"), so it's still
+                  fine for it to open the modal directly. We route it
+                  through fetchBookingOTP(..., true) instead of a bare
+                  setShowOTPModal(true) so it always shows accurate
+                  waiting/ready state instead of a stale one.
+                */}
+                {activeBooking.status === "arrived" && (
+                  <TouchableOpacity
+                    style={styles.completeButton}
+                    onPress={() => {
+                      setShowOTPModal(true);
+                      fetchBookingOTP(activeBooking.id, true);
+                    }}
+                  >
+                    <Text style={styles.completeButtonText}>
+                      Complete Service with OTP
+                    </Text>
+                  </TouchableOpacity>
+                )}
 
-              {activeBooking.status !== "arrived" && (
-                <TouchableOpacity
-                  style={styles.cancelTrackingButton}
-                  onPress={cancelActiveBooking}
-                >
-                  <Text style={styles.cancelTrackingButtonText}>
-                    Cancel Service
-                  </Text>
-                </TouchableOpacity>
-              )}
+                {activeBooking.status !== "arrived" && (
+                  <TouchableOpacity
+                    style={styles.cancelTrackingButton}
+                    onPress={cancelActiveBooking}
+                  >
+                    <Text style={styles.cancelTrackingButtonText}>
+                      Cancel Service
+                    </Text>
+                  </TouchableOpacity>
+                )}
+              </ScrollView>
             </View>
           </ModalSafeArea>
         </SafeAreaProvider>
@@ -2569,7 +3217,7 @@ export default function CustomerScreen() {
                 </TouchableOpacity>
 
                 <View style={styles.vehicleHeadingRow}>
-                  <Text style={styles.quickAccessHeading}>Quick Access</Text>
+                  <Text style={styles.quickAccessHeading}>Choose a Service</Text>
                   <TouchableOpacity
                     onPress={() => setShowServiceListModal(true)}
                     disabled={services.length === 0}
@@ -2644,67 +3292,100 @@ export default function CustomerScreen() {
                   })}
                 </View>
 
-                <View style={styles.vehicleHeadingRow}>
-                  <Text style={styles.quickAccessHeading}>Vehicle Type</Text>
-                  <TouchableOpacity
-                    onPress={() => setShowVehicleListModal(true)}
-                    disabled={vehicleTypesLoading || vehicleTypes.length === 0}
-                  >
-                    <Text style={styles.viewAllText}>View All</Text>
-                  </TouchableOpacity>
-                </View>
+                {/*
+                  ✅ Vehicle Type row. Hidden until a vehicle has been
+                  chosen — the vehicle-type modal now opens automatically
+                  the first time a service is selected (see
+                  handleQuickAccessPress / handleServiceModalSelect), so
+                  there's no need for an always-visible inline grid here
+                  anymore. Once a vehicle is selected, this shows it as a
+                  compact card; tapping the card or "View All" reopens the
+                  same modal to change the selection.
 
-                {vehicleTypesLoading ? (
-                  <ActivityIndicator
-                    size="small"
-                    color="#063F47"
-                    style={{ marginBottom: 16 }}
-                  />
-                ) : (
-                  <View style={styles.quickAccessGrid}>
-                    {vehicleTypes.slice(0, 4).map((vt) => {
-                      const isSelected = selectedVehicle?.id === vt.id;
-                      const icon = iconForVehicleCategory(vt.category);
-                      return (
-                        <TouchableOpacity
-                          key={vt.id}
-                          style={styles.quickAccessItem}
-                          onPress={() => handleVehicleSelect(vt)}
-                          disabled={creatingBooking || !!activeBooking}
+                  ✅ FIX — the delete button inside the selected-vehicle
+                  card now shows a dustbin (trash) icon instead of an ×
+                  in a circle, so it reads clearly as "remove/delete"
+                  rather than "close". Tapping it still clears BOTH the
+                  vehicle AND the chosen service via
+                  handleRemoveVehicleSelection().
+                */}
+                {selectedVehicle && (
+                  <>
+                    <View style={styles.vehicleHeadingRow}>
+                      <Text style={styles.quickAccessHeading}>Vehicle Type</Text>
+                      <TouchableOpacity
+                        onPress={() => setShowVehicleListModal(true)}
+                        disabled={vehicleTypesLoading || vehicleTypes.length === 0}
+                      >
+                        <Text style={styles.viewAllText}>View All</Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    <View style={styles.selectedVehicleCard}>
+                      <TouchableOpacity
+                        style={styles.selectedVehicleCardMain}
+                        onPress={() => setShowVehicleListModal(true)}
+                        activeOpacity={0.7}
+                        disabled={creatingBooking || !!activeBooking}
+                      >
+                        <View
+                          style={[
+                            styles.quickAccessIconCircle,
+                            styles.quickAccessIconCircleActive,
+                            styles.selectedVehicleIconWrap,
+                          ]}
                         >
-                          <View
-                            style={[
-                              styles.quickAccessIconCircle,
-                              isSelected && styles.quickAccessIconCircleActive,
-                            ]}
-                          >
-                            {icon.lib === "FontAwesome5" ? (
+                          {(() => {
+                            const icon = iconForVehicleCategory(
+                              selectedVehicle.category,
+                            );
+                            return icon.lib === "FontAwesome5" ? (
                               <FontAwesome5
                                 name={icon.name}
                                 size={20}
-                                color={isSelected ? "#EA580C" : "#063F47"}
+                                color="#EA580C"
                               />
                             ) : icon.lib === "MaterialCommunityIcons" ? (
                               <MaterialCommunityIcons
                                 name={icon.name as any}
                                 size={26}
-                                color={isSelected ? "#EA580C" : "#063F47"}
+                                color="#EA580C"
                               />
                             ) : (
                               <Ionicons
                                 name={icon.name as any}
                                 size={24}
-                                color={isSelected ? "#EA580C" : "#063F47"}
+                                color="#EA580C"
                               />
-                            )}
-                          </View>
-                          <Text style={styles.quickAccessLabel} numberOfLines={2}>
-                            {vt.name}
+                            );
+                          })()}
+                        </View>
+                        <View style={styles.selectedVehicleTextWrap}>
+                          <Text style={styles.selectedVehicleName} numberOfLines={1}>
+                            {selectedVehicle.name}
                           </Text>
-                        </TouchableOpacity>
-                      );
-                    })}
-                  </View>
+                          <Text style={styles.selectedVehicleSub}>
+                            Tap to change
+                          </Text>
+                        </View>
+                        <Ionicons
+                          name="chevron-forward"
+                          size={18}
+                          color="#94A3B8"
+                        />
+                      </TouchableOpacity>
+
+                      <TouchableOpacity
+                        style={styles.selectedVehicleDeleteButton}
+                        onPress={handleRemoveVehicleSelection}
+                        disabled={creatingBooking || !!activeBooking}
+                        hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                        accessibilityLabel="Remove selected vehicle and service"
+                      >
+                        <Ionicons name="trash-outline" size={20} color="#EF4444" />
+                      </TouchableOpacity>
+                    </View>
+                  </>
                 )}
 
                 {recentBooking ? (
@@ -3037,6 +3718,11 @@ const styles = StyleSheet.create({
   // (auto-sized) card below doesn't use, instead of a fixed height that
   // fought the card for room and either left a gap or caused overlap.
   mapContainerFull: { flex: 1 },
+  // ✅ FIX — reduced from 0.38 → 0.30 of screen height. The info card
+  // below (mechanic+call+ETA, vehicle, address, timeline, action button)
+  // needs more room than the map now, so the map gives up space instead
+  // of forcing the card to scroll to show everything.
+  trackingMapContainer: { height: height * 0.3 },
   map: { flex: 1 },
   waitingRecenterButton: {
     position: "absolute",
@@ -3133,16 +3819,6 @@ const styles = StyleSheet.create({
     width: 40,
     height: 40,
     borderRadius: 20,
-    justifyContent: "center",
-    alignItems: "center",
-    borderWidth: 3,
-    borderColor: "#FFF",
-  },
-  trackingMechanicMarker: {
-    backgroundColor: "#F59E0B",
-    width: 44,
-    height: 44,
-    borderRadius: 22,
     justifyContent: "center",
     alignItems: "center",
     borderWidth: 3,
@@ -3426,20 +4102,301 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    padding: 16,
+    paddingVertical: 9,
+    paddingHorizontal: 16,
     backgroundColor: "#FFF",
     borderBottomWidth: 1,
     borderBottomColor: "#E2E8F0",
   },
-  trackingTitle: { fontSize: 18, fontWeight: "700", color: "#063F47" },
-  trackingCancelButton: { padding: 8 },
+  trackingTitle: { fontSize: 15, fontWeight: "700", color: "#063F47" },
+  trackingCancelButton: { padding: 6 },
   vehicleSelector: { marginBottom: 16 },
+  // ✅ FIX — now flex:1 so it fills the remaining space below the fixed
+  // header + map, with an internal ScrollView handling overflow instead
+  // of the card growing past the screen.
   trackingInfoCard: {
+    flex: 1,
     backgroundColor: "#FFF",
-    padding: 20,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    marginTop: -20,
+    borderTopLeftRadius: 22,
+    borderTopRightRadius: 22,
+    marginTop: -18,
+  },
+  trackingInfoScroll: {
+    flex: 1,
+  },
+  trackingInfoScrollContent: {
+    paddingHorizontal: 16,
+    paddingTop: 10,
+  },
+  // ✅ Single merged "Mechanic + ETA" card. Top row = mechanic
+  // avatar/name/rating/call button (same content/styles as before).
+  // A thin divider separates it from the bottom "Arriving in ..." strip,
+  // so both pieces of info live in ONE section instead of two stacked
+  // cards.
+  mechanicEtaCard: {
+    backgroundColor: "#FFF",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginBottom: 8,
+  },
+  mechanicEtaTopRow: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  mechanicEtaDivider: {
+    height: 1,
+    backgroundColor: "#E2E8F0",
+    marginVertical: 8,
+  },
+  mechanicEtaBottomRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#E7F1F2",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#BFDBDD",
+    paddingVertical: 7,
+    paddingHorizontal: 10,
+  },
+  etaTextWrap: { flexShrink: 1 },
+  etaLabel: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#3F7176",
+  },
+  etaValueText: {
+    fontSize: 15,
+    fontWeight: "800",
+    color: "#063F47",
+    flexShrink: 0,
+  },
+  etaRing: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    borderWidth: 3,
+    borderColor: "#063F47",
+    borderRightColor: "#BFDBDD",
+    borderBottomColor: "#BFDBDD",
+    backgroundColor: "#FFF",
+    justifyContent: "center",
+    alignItems: "center",
+    marginRight: 10,
+  },
+  // ✅ Mechanic avatar / name / role / rating — shared by the merged
+  // mechanicEtaCard above.
+  mechanicAvatar2: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: "#063F47",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  mechanicTextWrap2: {
+    flex: 1,
+    marginLeft: 10,
+  },
+  mechanicNameText2: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#063F47",
+  },
+  mechanicRoleRatingRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 2,
+  },
+  mechanicRoleText2: {
+    fontSize: 11,
+    color: "#64748B",
+    fontWeight: "600",
+  },
+  mechanicRatingIcon: {
+    marginLeft: 8,
+    marginRight: 2,
+  },
+  mechanicRatingText: {
+    fontSize: 11,
+    color: "#334155",
+    fontWeight: "700",
+  },
+  callButton2: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: "#E7F1F2",
+    borderWidth: 1,
+    borderColor: "#BFDBDD",
+    justifyContent: "center",
+    alignItems: "center",
+    marginLeft: 8,
+  },
+  // ✅ Dimmed state for the call button when no mechanic phone number is
+  // available yet — button stays visible (never disappears) but reads
+  // as inactive.
+  callButton2Disabled: {
+    backgroundColor: "#F1F5F9",
+    borderColor: "#E2E8F0",
+  },
+  // ✅ Vehicle + service summary row.
+  vehicleCard2: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#FFF7ED",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#FDE1C2",
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    marginBottom: 8,
+  },
+  vehicleIconWrap2: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: "#FFF",
+    borderWidth: 1,
+    borderColor: "#FDE1C2",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  vehicleTextWrap2: {
+    flex: 1,
+    marginLeft: 10,
+    marginRight: 8,
+  },
+  vehicleNameText2: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#063F47",
+  },
+  vehicleSubText2: {
+    fontSize: 11,
+    color: "#94734B",
+    marginTop: 1,
+  },
+  vehiclePriceText2: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#EA580C",
+    flexShrink: 0,
+  },
+  addressRow2: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    marginBottom: 8,
+    paddingHorizontal: 2,
+    gap: 6,
+  },
+  addressText2: {
+    flex: 1,
+    fontSize: 12,
+    color: "#64748B",
+    lineHeight: 16,
+  },
+  // ✅ NEW — small inline "waiting for pin" strip shown on the tracking
+  // screen while status is "arrived" but no OTP has been generated yet.
+  // Replaces forcing the OTP modal open on arrival.
+  awaitingOtpStrip: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#FFFBEB",
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#FDE68A",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginBottom: 12,
+    gap: 10,
+  },
+  awaitingOtpStripText: {
+    flex: 1,
+    fontSize: 12,
+    color: "#92400E",
+    fontWeight: "600",
+    lineHeight: 16,
+  },
+  // ✅ Vertical status timeline — dot + connecting line per step, with a
+  // right-aligned timestamp column, matching the reference design's
+  // "Request Confirmed / Expert Assigned / On the Way / ..." list.
+  // Redesigned so label + timestamp sit on the SAME row as the dot
+  // (timelineRightCol is a row, not a column with a big marginBottom),
+  // which removes the large empty gaps between steps seen previously —
+  // spacing between rows now comes only from timelineRightCol's
+  // paddingBottom, so it can never disagree with the connecting line's
+  // height.
+  timelineCard: {
+    backgroundColor: "#F8FAFC",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginBottom: 10,
+  },
+  timelineRow: {
+    flexDirection: "row",
+  },
+  timelineLeftCol: {
+    alignItems: "center",
+    width: 22,
+  },
+  timelineDot: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: "#FFF",
+    borderWidth: 2,
+    borderColor: "#CBD5E1",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  timelineDotDone: {
+    backgroundColor: "#10B981",
+    borderColor: "#10B981",
+  },
+  timelineLine: {
+    width: 2,
+    flex: 1,
+    minHeight: 16,
+    backgroundColor: "#E2E8F0",
+    marginVertical: 2,
+  },
+  timelineLineDone: {
+    backgroundColor: "#10B981",
+  },
+  timelineRightCol: {
+    flex: 1,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginLeft: 10,
+    paddingBottom: 10,
+  },
+  timelineRightColLast: {
+    paddingBottom: 0,
+  },
+  timelineLabel: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#94A3B8",
+    marginRight: 8,
+  },
+  timelineLabelDone: {
+    color: "#063F47",
+    fontWeight: "700",
+  },
+  timelineTime: {
+    fontSize: 11,
+    color: "#94A3B8",
+    fontWeight: "600",
+    flexShrink: 0,
   },
   trackingInfoRow: {
     flexDirection: "row",
@@ -3484,27 +4441,29 @@ const styles = StyleSheet.create({
   statusValue: { color: "#10B981", fontWeight: "700" },
   etaValue: { color: "#F59E0B", fontWeight: "700" },
   routeErrorText: {
-    fontSize: 12,
+    fontSize: 11,
     color: "#EF4444",
     textAlign: "center",
-    marginTop: 8,
+    marginBottom: 10,
   },
   completeButton: {
     backgroundColor: "#10B981",
-    padding: 16,
-    borderRadius: 12,
+    paddingVertical: 12,
+    borderRadius: 14,
     alignItems: "center",
-    marginTop: 16,
+    marginBottom: 4,
   },
-  completeButtonText: { color: "#FFF", fontSize: 16, fontWeight: "700" },
+  completeButtonText: { color: "#FFF", fontSize: 14, fontWeight: "700" },
   cancelTrackingButton: {
-    backgroundColor: "#EF4444",
-    padding: 14,
-    borderRadius: 12,
+    backgroundColor: "#FFF",
+    borderWidth: 1.5,
+    borderColor: "#EF4444",
+    paddingVertical: 11,
+    borderRadius: 14,
     alignItems: "center",
-    marginTop: 12,
+    marginBottom: 4,
   },
-  cancelTrackingButtonText: { color: "#FFF", fontSize: 14, fontWeight: "600" },
+  cancelTrackingButtonText: { color: "#EF4444", fontSize: 13, fontWeight: "700" },
   loadingMapContainer: {
     flex: 1,
     justifyContent: "center",
@@ -4092,5 +5051,61 @@ homeMechanicMarker: {
     color: "#EA580C",
     fontSize: 13,
     fontWeight: "700",
+  },
+  // ✅ Compact card shown under "Vehicle Type" once a vehicle has been
+  // selected — tapping the main row (or "View All" above) reopens the
+  // vehicle picker modal to change the selection. Now a row containing
+  // the tappable "main" content plus a separate delete (dustbin) button,
+  // so the two touch targets don't fight each other.
+  selectedVehicleCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#FFF",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginBottom: 16,
+  },
+  // ✅ wraps the icon + name/subtitle + chevron; this is the part
+  // that opens the vehicle picker modal on tap. Kept as its own flex
+  // row so the delete button can sit outside it, at the end of the card.
+  selectedVehicleCardMain: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  selectedVehicleIconWrap: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    marginBottom: 0,
+  },
+  selectedVehicleTextWrap: {
+    flex: 1,
+    marginLeft: 12,
+  },
+  selectedVehicleName: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#063F47",
+  },
+  selectedVehicleSub: {
+    fontSize: 12,
+    color: "#94A3B8",
+    marginTop: 2,
+  },
+  // ✅ FIX — the delete/remove button on the selected-vehicle card. Now
+  // rendered as a plain dustbin (trash) icon instead of a filled ×
+  // circle, matching the "remove" affordance more clearly. Tapping it
+  // calls handleRemoveVehicleSelection(), clearing both the vehicle and
+  // the chosen service. Sits outside selectedVehicleCardMain so it has
+  // its own touch target, separate from "tap to change".
+  selectedVehicleDeleteButton: {
+    marginLeft: 10,
+    paddingLeft: 6,
+    paddingVertical: 4,
+    paddingRight: 2,
   },
 });

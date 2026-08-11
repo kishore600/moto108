@@ -119,6 +119,21 @@ class SocketService {
       this.emitEvent("request:mechanic:location", data);
     });
 
+    // ✅ FIX — this handler was missing. The mechanic dashboard calls
+    // emitOtpGenerated(), which the server broadcasts back out as an
+    // "otp:generated" socket event to everyone in the booking room
+    // (including the customer). Without registering this raw-socket
+    // listener here, that event would arrive at the client but never
+    // get forwarded into our internal emitEvent() dispatcher — so
+    // customer.tsx's `socketService.on("otp:generated", handleOtpGenerated)`
+    // would never fire, and the "Service Completion" screen would never
+    // open. This mirrors the exact same on(...) -> emitEvent(...)
+    // pattern used for every other event above.
+    this.socket.on("otp:generated", (data) => {
+      console.log("🔐 OTP generated:", data);
+      this.emitEvent("otp:generated", data);
+    });
+
     this.socket.on("otp:verified", (data) => {
       console.log("🔐 OTP verified:", data);
       this.emitEvent("otp:verified", data);
@@ -297,6 +312,19 @@ class SocketService {
   public emitNewBooking(bookingData: any) {
     if (!bookingData) return;
     this.safeEmit("booking:new", bookingData);
+  }
+
+  // ✅ FIX — this is the method the mechanic dashboard was calling
+  // (`socketService.emitOtpGenerated(bookingId, user?.id)`) that didn't
+  // exist yet, causing the "Property 'emitOtpGenerated' does not exist
+  // on type 'SocketService'" build error. Mirrors emitOtpVerified below.
+  public emitOtpGenerated(
+    bookingId: string | null | undefined,
+    mechanicId?: string,
+  ) {
+    if (!bookingId) return;
+    this.safeEmit("otp:generated", { bookingId, mechanicId });
+    console.log(`📤 Emitted otp:generated for booking: ${bookingId}`);
   }
 
   public emitOtpVerified(bookingId: string | null | undefined) {
