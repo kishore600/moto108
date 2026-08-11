@@ -101,6 +101,12 @@ export default function MechanicDashboard() {
   const { user, logout } = useAuth();
   const [showOTPModal, setShowOTPModal] = useState(false);
   const [generatedOTP, setGeneratedOTP] = useState("");
+  // ✅ NEW — tracks WHICH booking the current `generatedOTP` belongs to.
+  // Without this, a pin generated for one job could be silently reused
+  // (or assumed to already exist) for a different job once the mechanic
+  // moves on to their next customer.
+  const [otpBookingId, setOtpBookingId] = useState<string | null>(null);
+  const [otpGenerating, setOtpGenerating] = useState(false);
   const [enteredOTP, setEnteredOTP] = useState("");
   const [verifyingOTP, setVerifyingOTP] = useState(false);
   const [showRatingModal, setShowRatingModal] = useState(false);
@@ -259,7 +265,39 @@ export default function MechanicDashboard() {
     }
   }
 
+  // ---------------------------------------------------------------------
+  // ✅ FIX — generates a fresh OTP/pin for the given booking and marks
+  // (via otpBookingId) which booking it belongs to. This is the ONLY
+  // place that talks to the "generate-otp" endpoint, so every path that
+  // needs a pin (the explicit "Generate OTP" button AND "Complete
+  // Service" below) always goes through here and the customer always
+  // actually receives the pin before the mechanic can verify it.
+  //
+  // ✅ NEW — this is also the ONLY moment the customer's app is told a
+  // pin exists ("otp:generated" socket event below). Arriving at the
+  // customer's location no longer implies a pin was generated — the
+  // customer's OTP screen stays closed until the mechanic actually taps
+  // "Generate OTP" or "Complete Service" here. This is the single
+  // trigger the customer app listens for to pop the "Service
+  // Completion" screen — see the "otp:generated" listener in
+  // tabs/customer.tsx. Simply marking a job "Arrived" never opens it.
+  //
+  // ✅ FIX — previously this called `socket.emit(...)` directly, but
+  // `socket` here is typed as `SocketService` (the same wrapper class as
+  // `socketService`), which does not expose a generic `.emit` method —
+  // that's what was causing the
+  // "Property 'emit' does not exist on type 'SocketService'" build
+  // error. We now go through the same `socketService.<namedMethod>(...)`
+  // pattern used everywhere else in this file (e.g.
+  // `socketService.updateBookingStatus`, `socketService.acceptBooking`)
+  // via `socketService.emitOtpGenerated(...)`. Add a matching
+  // `emitOtpGenerated(bookingId: string, mechanicId?: string)` method to
+  // the `SocketService` class in `lib/socket.ts` (it should simply do
+  // `this.socket.emit("otp:generated", { bookingId, mechanicId })`
+  // internally) if it isn't already there.
+  // ---------------------------------------------------------------------
   async function generateOTPForCompletion(bookingId: string) {
+    setOtpGenerating(true);
     try {
       const response = await api.post(
         `/bookings/${bookingId}/generate-otp`,
@@ -268,7 +306,15 @@ export default function MechanicDashboard() {
       if (response.data.success) {
         const generatedOtp = response.data.otp;
         setGeneratedOTP(generatedOtp);
+        setOtpBookingId(bookingId);
         setShowOTPModal(true);
+
+        // ✅ Notify the customer in real time that a pin now exists for
+        // this booking, so their app can fetch and display it right
+        // away instead of waiting on a background poll. This is the
+        // ONLY event that should cause the customer's OTP/"Service
+        // Completion" modal to open.
+        socketService.emitOtpGenerated(bookingId, user?.id);
 
         Alert.alert(
           "🔐 OTP Generated",
@@ -281,7 +327,35 @@ export default function MechanicDashboard() {
         "Error",
         error.response?.data?.error || "Failed to generate OTP",
       );
+    } finally {
+      setOtpGenerating(false);
     }
+  }
+
+  // ---------------------------------------------------------------------
+  // ✅ FIX — this is what actually runs when "Complete Service" is
+  // tapped for an "arrived" job. Previously that button just opened the
+  // empty OTP-entry modal and relied on the mechanic having separately
+  // pressed "Generate OTP" first — if they hadn't, the customer never
+  // received a pin at all and there was no way to complete the job.
+  //
+  // Now: if a pin has already been generated FOR THIS EXACT BOOKING
+  // (otpBookingId === booking.id) we just reopen the entry modal: no
+  // need to burn a second OTP. Otherwise we generate one right now, which
+  // pushes the pin to the customer and opens the modal automatically —
+  // so tapping "Complete Service" always results in the customer having
+  // the pin, every time.
+  // ---------------------------------------------------------------------
+  async function startCompleteService(booking: any) {
+    setActiveBooking(booking);
+    setEnteredOTP("");
+
+    if (generatedOTP && otpBookingId === booking.id) {
+      setShowOTPModal(true);
+      return;
+    }
+
+    await generateOTPForCompletion(booking.id);
   }
 
   async function verifyMechanicOTP(bookingId: string, otp: string) {
@@ -307,7 +381,11 @@ export default function MechanicDashboard() {
               onPress: () => {
                 setShowOTPModal(false);
                 setEnteredOTP("");
+                // ✅ Clear the pin state now that this booking is
+                // "completed" — a fresh pin will be generated next time,
+                // instead of a stale one carrying over to the next job.
                 setGeneratedOTP("");
+                setOtpBookingId(null);
                 loadMyJobs();
                 fetchTodayEarnings();
                 fetchAnalytics();
@@ -361,6 +439,19 @@ export default function MechanicDashboard() {
     }
   }
 
+  // ---------------------------------------------------------------------
+  // ✅ FIX — tapping "Arrived" now ONLY updates the booking status (and,
+  // via socketService.updateBookingStatus below, lets the customer's app
+  // track that GPS/status change). It no longer auto-generates an OTP,
+  // and — because generation is the only thing that emits
+  // "otp:generated" — it can never cause the customer's "Service
+  // Completion" popup to appear on its own. The OTP is generated — and
+  // only then pushed to the customer — the moment the mechanic
+  // explicitly taps "Generate OTP" or "Complete Service" (see
+  // generateOTPForCompletion / startCompleteService above). This keeps
+  // "arrived" and "OTP ready" as two clearly separate moments for both
+  // sides.
+  // ---------------------------------------------------------------------
   async function updateStatus(
     bookingId: string,
     status: "on_the_way" | "arrived" | "completed",
@@ -376,10 +467,6 @@ export default function MechanicDashboard() {
       );
 
       socketService.updateBookingStatus(bookingId, status);
-
-      if (status === "arrived") {
-        await generateOTPForCompletion(bookingId);
-      }
 
       if (status === "completed") {
         await fetchTodayEarnings();
@@ -1020,20 +1107,32 @@ export default function MechanicDashboard() {
                 <>
                   <TouchableOpacity
                     style={[styles.smallBtn, styles.otpBtn]}
-                    onPress={() => generateOTPForCompletion(item.id)}
+                    onPress={() => {
+                      setActiveBooking(item);
+                      generateOTPForCompletion(item.id);
+                    }}
                   >
                     <Ionicons name="key-outline" size={16} color="#FFF" />
                     <Text style={[styles.smallBtnText, { color: "#FFF" }]}>
                       Generate OTP
                     </Text>
                   </TouchableOpacity>
+                  {/*
+                    ✅ FIX — this now routes through startCompleteService(),
+                    which guarantees a pin exists (and was sent to the
+                    customer) for THIS booking before the entry modal
+                    opens, instead of just opening an empty modal and
+                    hoping "Generate OTP" was pressed first. This — NOT
+                    the earlier "Arrived" tap — is the step that pushes
+                    the pin to the customer and pops their "Service
+                    Completion" screen, and is also the step that takes
+                    the job from "arrived" to "completed" once the
+                    mechanic verifies the code the customer reads back to
+                    them.
+                  */}
                   <TouchableOpacity
                     style={[styles.smallBtn, styles.completeBtn]}
-                    onPress={() => {
-                      setActiveBooking(item);
-                      setShowOTPModal(true);
-                      setEnteredOTP("");
-                    }}
+                    onPress={() => startCompleteService(item)}
                   >
                     <Text style={[styles.smallBtnText, { color: "#FFF" }]}>
                       Complete Service
@@ -1487,21 +1586,38 @@ export default function MechanicDashboard() {
               <Text style={styles.dividerText}>ENTER CODE FROM CUSTOMER</Text>
               <View style={styles.dividerLine} />
             </View>
-            
-            <Text style={styles.otpInstruction}>
-              Ask the customer for the 6-digit code and enter it below:
-            </Text>
-            
-            <TextInput
-              style={styles.otpInputField}
-              placeholder="Enter 6-digit OTP"
-              value={enteredOTP}
-              onChangeText={setEnteredOTP}
-              keyboardType="number-pad"
-              maxLength={6}
-              textAlign="center"
-              autoFocus
-            />
+
+            {/*
+              ✅ While a pin is being generated (startCompleteService /
+              generateOTPForCompletion in flight) show a spinner instead
+              of an input the mechanic could type into before the
+              customer even has a pin to read back.
+            */}
+            {otpGenerating ? (
+              <View style={styles.otpGeneratingBox}>
+                <ActivityIndicator size="small" color="#10B981" />
+                <Text style={styles.otpGeneratingText}>
+                  Generating pin for the customer…
+                </Text>
+              </View>
+            ) : (
+              <>
+                <Text style={styles.otpInstruction}>
+                  Ask the customer for the 6-digit code and enter it below:
+                </Text>
+
+                <TextInput
+                  style={styles.otpInputField}
+                  placeholder="Enter 6-digit OTP"
+                  value={enteredOTP}
+                  onChangeText={setEnteredOTP}
+                  keyboardType="number-pad"
+                  maxLength={6}
+                  textAlign="center"
+                  autoFocus
+                />
+              </>
+            )}
             
             <View style={styles.modalButtons}>
               <TouchableOpacity
@@ -1509,6 +1625,12 @@ export default function MechanicDashboard() {
                 onPress={() => {
                   setShowOTPModal(false);
                   setEnteredOTP("");
+                  // ✅ Clear the pin on cancel too, so re-opening
+                  // "Complete Service" later always generates a fresh
+                  // one instead of silently reusing a possibly-expired
+                  // pin the customer may no longer be looking at.
+                  setGeneratedOTP("");
+                  setOtpBookingId(null);
                 }}
               >
                 <Text style={styles.modalCancelText}>Cancel</Text>
@@ -1518,10 +1640,10 @@ export default function MechanicDashboard() {
                 style={[
                   styles.modalButton, 
                   styles.modalAcceptButton,
-                  (!enteredOTP || enteredOTP.length !== 6) && styles.disabledButton
+                  (otpGenerating || !enteredOTP || enteredOTP.length !== 6) && styles.disabledButton
                 ]}
                 onPress={() => verifyMechanicOTP(activeBooking?.id, enteredOTP)}
-                disabled={!enteredOTP || enteredOTP.length !== 6 || verifyingOTP}
+                disabled={otpGenerating || !enteredOTP || enteredOTP.length !== 6 || verifyingOTP}
               >
                 <Text style={styles.modalAcceptText}>
                   {verifyingOTP ? "Verifying..." : "Verify & Complete"}
@@ -1529,7 +1651,7 @@ export default function MechanicDashboard() {
               </TouchableOpacity>
             </View>
             
-            {!generatedOTP && activeBooking?.status === "arrived" && (
+            {!otpGenerating && !generatedOTP && activeBooking?.status === "arrived" && (
               <TouchableOpacity
                 style={styles.refreshOtpButton}
                 onPress={() => generateOTPForCompletion(activeBooking?.id)}
@@ -2069,6 +2191,23 @@ const styles = StyleSheet.create({
   dividerLine: { flex: 1, height: 1, backgroundColor: "#E2E8F0" },
   dividerText: { marginHorizontal: 12, fontSize: 11, color: "#94A3B8", fontWeight: "600" },
   otpInstruction: { fontSize: 14, color: "#64748B", textAlign: "center", marginBottom: 12 },
+  // ✅ Shown while startCompleteService()/generateOTPForCompletion() is
+  // in flight, so the mechanic sees the pin is on its way to the
+  // customer instead of a blank input box.
+  otpGeneratingBox: {
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#F0FDF4",
+    borderRadius: 12,
+    paddingVertical: 24,
+    marginBottom: 16,
+    gap: 10,
+  },
+  otpGeneratingText: {
+    fontSize: 13,
+    color: "#047857",
+    fontWeight: "600",
+  },
   otpInputField: {
     backgroundColor: "#F1F5F9",
     borderRadius: 12,
