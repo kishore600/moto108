@@ -266,20 +266,24 @@ export default function MechanicDashboard() {
         {},
       );
       if (response.data.success) {
-        const generatedOtp = response.data.otp;
-        setGeneratedOTP(generatedOtp);
+        // The OTP itself is texted to the customer, not returned here — this
+        // just marks that a code was requested (devOtp only appears outside
+        // production, for local testing without SMS).
+        setGeneratedOTP(response.data.devOtp || "sent");
         setShowOTPModal(true);
 
         Alert.alert(
-          "🔐 OTP Generated",
-          `Share this OTP with the customer:\n\n${generatedOtp}\n\n⚠️ This OTP will expire in 10 minutes.\n\nThen ask the customer for the code and enter it below.`,
+          "🔐 OTP Sent",
+          response.data.devOtp
+            ? `${response.data.message}\n\nDev OTP: ${response.data.devOtp}`
+            : response.data.message,
           [{ text: "OK" }],
         );
       }
     } catch (error: any) {
       Alert.alert(
         "Error",
-        error.response?.data?.error || "Failed to generate OTP",
+        error?.message || "Failed to generate OTP",
       );
     }
   }
@@ -294,7 +298,6 @@ export default function MechanicDashboard() {
     try {
       const response = await api.post(`/bookings/${bookingId}/verify-otp`, {
         otp: otp,
-        mechanicId: user?.id,
       });
 
       if (response.data.success) {
@@ -319,7 +322,7 @@ export default function MechanicDashboard() {
     } catch (error: any) {
       Alert.alert(
         "Verification Failed",
-        error.response?.data?.error || "Invalid OTP. Please try again.",
+        error?.message || "Invalid OTP. Please try again.",
       );
     } finally {
       setVerifyingOTP(false);
@@ -356,7 +359,7 @@ export default function MechanicDashboard() {
     } catch (error: any) {
       Alert.alert(
         "Error",
-        error.response?.data?.error || "Failed to submit rating",
+        error?.message || "Failed to submit rating",
       );
     }
   }
@@ -642,7 +645,7 @@ export default function MechanicDashboard() {
       setEditingProfile(false);
       loadMechanicProfile();
     } catch (error: any) {
-      Alert.alert("Error", error.response?.data?.error || "Failed to update profile");
+      Alert.alert("Error", error?.message || "Failed to update profile");
     }
   }
 
@@ -757,7 +760,7 @@ export default function MechanicDashboard() {
         );
         await loadOpenJobs();
       } else {
-        Alert.alert("Error", error.response?.data?.error || "Failed to accept job");
+        Alert.alert("Error", error?.message || "Failed to accept job");
       }
     } finally {
       setAccepting(false);

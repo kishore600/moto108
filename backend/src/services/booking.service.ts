@@ -1,6 +1,7 @@
 // services/booking.service.ts
 
 import { supabaseAdmin } from "../config/supabase";
+import { twilioClient } from "../config/twilio";
 import {
   emitBookingUpdate,
   emitMechanicLocation,
@@ -130,6 +131,16 @@ export async function getServiceByName(name: string) {
     .from("services")
     .select("*")
     .eq("name", name)
+    .single();
+  if (error && error.code !== "PGRST116") throw error;
+  return data;
+}
+
+export async function getServiceById(serviceId: string) {
+  const { data, error } = await supabaseAdmin
+    .from("services")
+    .select("*")
+    .eq("id", serviceId)
     .single();
   if (error && error.code !== "PGRST116") throw error;
   return data;
@@ -979,10 +990,34 @@ export async function addCustomerRating(
   return data;
 }
 
-// Generate OTP for job completion
+// Generate OTP for job completion.
+// The OTP is texted to the CUSTOMER, not shown to the mechanic — the whole
+// point is that the mechanic has to ask the customer for it on-site, so
+// completion actually requires the customer's involvement.
 export async function generateCompletionOTP(
   bookingId: string,
-): Promise<string> {
+  mechanicId: string,
+): Promise<{ sent: boolean; devOtp?: string }> {
+  const { data: existing, error: fetchError } = await supabaseAdmin
+    .from("bookings")
+    .select("mechanic_id, status")
+    .eq("id", bookingId)
+    .single();
+
+  if (fetchError || !existing) {
+    throw new Error("Booking not found");
+  }
+
+  if (existing.mechanic_id !== mechanicId) {
+    throw new Error("You are not authorized to generate an OTP for this booking");
+  }
+
+  if (existing.status !== "arrived") {
+    throw new Error(
+      "OTP can only be generated after you've marked yourself as arrived",
+    );
+  }
+
   // Generate 6-digit OTP
   const otp = Math.floor(100000 + Math.random() * 900000).toString();
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes expiry
@@ -996,13 +1031,36 @@ export async function generateCompletionOTP(
     })
     .eq("id", bookingId)
     .eq("status", "arrived") // Only if mechanic has arrived
-    .select()
+    .eq("mechanic_id", mechanicId)
+    .select("customer:profiles!bookings_customer_id_fkey(phone)")
     .single();
 
   if (error) throw error;
 
-  console.log(`OTP generated for booking ${bookingId}: ${otp}`);
-  return otp;
+  let sent = false;
+  const customerPhone = (data as any)?.customer?.phone;
+
+  if (customerPhone) {
+    try {
+      await twilioClient.messages.create({
+        body: `Your RoadAssist completion code is ${otp}. Only share it with your mechanic once the job is done. It expires in 10 minutes.`,
+        to: customerPhone,
+        from: process.env.TWILIO_PHONE_NUMBER,
+      });
+      sent = true;
+    } catch (twilioError) {
+      console.error(`Failed to SMS completion OTP for booking ${bookingId}:`, twilioError);
+    }
+  } else {
+    console.error(`No customer phone on file for booking ${bookingId}; completion OTP not sent`);
+  }
+
+  console.log(`Completion OTP generated for booking ${bookingId} (sent: ${sent})`);
+
+  return {
+    sent,
+    ...(process.env.NODE_ENV !== "production" ? { devOtp: otp } : {}),
+  };
 }
 
 // Mechanic submits rating for customer

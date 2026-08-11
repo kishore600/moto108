@@ -15,18 +15,8 @@ interface User {
 interface AuthContextType {
   user: User | null;
   isLoading: boolean;
-  login: (email: string, password: string) => Promise<boolean>;
-  signup: (data: SignupData) => Promise<boolean>;
   logout: () => Promise<void>;
   checkSession: () => Promise<void>;
-}
-
-interface SignupData {
-  email: string;
-  password: string;
-  fullName: string;
-  role: 'customer' | 'mechanic';
-  phone?: string;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -42,11 +32,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   async function checkSession() {
     try {
       // Check for stored token and user data in SecureStore
-      const token = await SecureStore.getItemAsync('token');
-      const userData = await SecureStore.getItemAsync('user_data');
-      
-      console.log('Token exists:', !!token,userData);
-      
+      let token = await SecureStore.getItemAsync('auth_token');
+      let userData = await SecureStore.getItemAsync('user');
+
+      // Migrate sessions written by older builds under the legacy key names
+      if (!token || !userData) {
+        const legacyToken = await SecureStore.getItemAsync('token');
+        const legacyUserData = await SecureStore.getItemAsync('user_data');
+        if (legacyToken && legacyUserData) {
+          token = legacyToken;
+          userData = legacyUserData;
+          await SecureStore.setItemAsync('auth_token', legacyToken);
+          await SecureStore.setItemAsync('user', legacyUserData);
+          await SecureStore.deleteItemAsync('token');
+          await SecureStore.deleteItemAsync('user_data');
+        }
+      }
+
+      console.log('Token exists:', !!token, userData);
+
       if (token && userData) {
         const parsedUser = JSON.parse(userData);
         setUser(parsedUser);
@@ -71,75 +75,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }
 
   async function clearSession() {
+    await SecureStore.deleteItemAsync('auth_token');
+    await SecureStore.deleteItemAsync('user');
     await SecureStore.deleteItemAsync('token');
     await SecureStore.deleteItemAsync('user_data');
     api.clearToken();
     setUser(null);
-  }
-
-  async function login(email: string, password: string): Promise<boolean> {
-    try {
-      const { data } = await api.post('/auth/login', { email, password });
-      
-      if (data.success || data.token) {
-        // Store token and user data securely
-        await SecureStore.setItemAsync('token', data.token);
-        await SecureStore.setItemAsync('user_data', JSON.stringify(data.user));
-        
-        // Set token in API client for subsequent requests
-        api.setToken(data.token);
-        api.setUser(data.user);
-        setUser(data.user);
-        
-        // Navigate based on role
-        if (data.user.role === 'mechanic') {
-          router.replace('/mechanic/dashboard');
-        } else {
-          router.replace('/(tabs)/customer');
-        }
-        
-        Alert.alert('Success', 'Logged in successfully!');
-        return true;
-      } else {
-        throw new Error('Login failed');
-      }
-    } catch (error: any) {
-      console.error('Login error:', error);
-      Alert.alert('Login Failed', error.message || 'Invalid credentials');
-      return false;
-    }
-  }
-
-  async function signup(data: SignupData): Promise<boolean> {
-    try {
-      const response = await api.post('/auth/signup', data);
-      
-      if (response.data.success || response.data.token) {
-        // Store token and user data securely
-        await SecureStore.setItemAsync('token', response.data.token);
-        await SecureStore.setItemAsync('user_data', JSON.stringify(response.data.user));
-        
-        // Set token in API client for subsequent requests
-        api.setToken(response.data.token);
-        setUser(response.data.user);
-        
-        // Navigate based on role
-        if (response.data.user.role === 'mechanic') {
-          router.replace('/mechanic/dashboard');
-        } else {
-          router.replace('/(tabs)/customer');
-        }
-        
-        Alert.alert('Success', 'Account created successfully!');
-        return true;
-      } else {
-        throw new Error('Signup failed');
-      }
-    } catch (error: any) {
-      console.error('Signup error:', error);
-      Alert.alert('Signup Failed', error.message || 'Could not create account');
-      return false;
-    }
   }
 
   async function logout() {
@@ -162,7 +103,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <AuthContext.Provider value={{ user, isLoading, login, signup, logout, checkSession }}>
+    <AuthContext.Provider value={{ user, isLoading, logout, checkSession }}>
       {children}
     </AuthContext.Provider>
   );

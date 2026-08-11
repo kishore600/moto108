@@ -1,17 +1,10 @@
 // routes/auth.ts
 import { Router } from 'express';
-import bcrypt from 'bcrypt';
 import { supabaseAdmin } from '../config/supabase';
 import { signToken } from '../utils/jwt';
-import twilio from 'twilio';
+import { twilioClient } from '../config/twilio';
 
 const router = Router();
-
-// Initialize Twilio client
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID!,
-  process.env.TWILIO_AUTH_TOKEN!
-);
 
 // Store OTPs temporarily (use Redis in production)
 const otpStore = new Map();
@@ -66,12 +59,12 @@ router.post('/send-otp', async (req, res) => {
       });
     } catch (twilioError) {
       console.error('Twilio error:', twilioError);
-      
-      // Fallback for development
-      res.json({ 
-        success: true, 
+
+      // Fallback for development only — never leak the real OTP in production
+      res.json({
+        success: true,
         message: 'OTP sent successfully',
-        devOtp: otp
+        ...(process.env.NODE_ENV !== 'production' && { devOtp: otp }),
       });
     }
 
@@ -185,17 +178,18 @@ router.post('/send-signup-otp', async (req, res) => {
         from: process.env.TWILIO_PHONE_NUMBER
       });
 
-      res.json({ 
-        success: true, 
+      res.json({
+        success: true,
         message: 'OTP sent successfully'
       });
     } catch (twilioError) {
       console.error('Twilio error:', twilioError);
-      
-      res.json({ 
-        success: true, 
+
+      // Fallback for development only — never leak the real OTP in production
+      res.json({
+        success: true,
         message: 'OTP sent successfully',
-        devOtp: otp
+        ...(process.env.NODE_ENV !== 'production' && { devOtp: otp }),
       });
     }
 
@@ -208,10 +202,15 @@ router.post('/send-signup-otp', async (req, res) => {
 // Verify signup OTP and create account
 router.post('/verify-signup-otp', async (req, res) => {
   try {
-    const { phone, otp, email, password, fullName, role } = req.body;
+    const { phone, otp, email, fullName, role } = req.body;
 
     if (!phone || !otp || !fullName) {
       return res.status(400).json({ error: 'Phone, OTP, and full name are required' });
+    }
+
+    const allowedRoles = ['customer', 'mechanic'];
+    if (role && !allowedRoles.includes(role)) {
+      return res.status(400).json({ error: 'Invalid role. Must be "customer" or "mechanic"' });
     }
 
     let formattedPhone = phone;
@@ -220,7 +219,7 @@ router.post('/verify-signup-otp', async (req, res) => {
     }
 
     const storedData = otpStore.get(`signup_${formattedPhone}`);
-    
+
     if (!storedData) {
       return res.status(400).json({ error: 'OTP expired or not requested' });
     }
@@ -234,20 +233,28 @@ router.post('/verify-signup-otp', async (req, res) => {
       return res.status(400).json({ error: 'Invalid OTP' });
     }
 
-    // Prepare user data - email and password are optional
+    // Email is optional, but if given it must not already be in use
+    if (email) {
+      const { data: existingEmailUser } = await supabaseAdmin
+        .from('profiles')
+        .select('id')
+        .eq('email', email)
+        .single();
+
+      if (existingEmailUser) {
+        return res.status(400).json({ error: 'Email address already registered' });
+      }
+    }
+
+    // Prepare user data - email is optional
     const userData: any = {
       full_name: fullName,
       role: role || 'customer',
       phone: formattedPhone
     };
 
-    // Only add email and password if provided
     if (email) {
       userData.email = email;
-    }
-    
-    if (password) {
-      userData.password = await bcrypt.hash(password, 10);
     }
 
     // Create user
