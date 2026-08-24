@@ -6,10 +6,10 @@ import {
   Alert 
 } from 'react-native';
 import { router, Link } from 'expo-router';
-import { useAuth } from '@/context/AuthContext';
-import * as SecureStore from 'expo-secure-store';
-import { api } from '@/lib/api'; 
+import { api } from '@/lib/api';
 
+// Already-logged-in users are redirected by AuthContext.checkSession()
+// at app boot (see app/_layout.tsx), so this screen doesn't duplicate that check.
 export default function LoginScreen() {
   const [phone, setPhone] = useState('');
   const [otp, setOtp] = useState('');
@@ -17,37 +17,15 @@ export default function LoginScreen() {
   const [loading, setLoading] = useState(false);
   const [otpLoading, setOtpLoading] = useState(false);
   const [countdown, setCountdown] = useState(0);
-  const { user } = useAuth();
 
   // Countdown timer for OTP resend
   useEffect(() => {
-    let timer: NodeJS.Timeout;
+    let timer: ReturnType<typeof setTimeout>;
     if (countdown > 0) {
       timer = setTimeout(() => setCountdown(countdown - 1), 1000);
     }
     return () => clearTimeout(timer);
   }, [countdown]);
-
-  // Check if user is already logged in
-  useEffect(() => {
-    checkExistingSession();
-  }, []);
-
-  async function checkExistingSession() {
-    try {
-      const token = await SecureStore.getItemAsync('token');
-      const userData = await SecureStore.getItemAsync('user_data');
-      if (token && userData && user) {
-        if (user.role === 'mechanic') {
-          router.replace('/mechanic/dashboard');
-        } else {
-          router.replace('/(tabs)/customer');
-        }
-      }
-    } catch (error) {
-      console.error('Error checking session:', error);
-    }
-  }
 
   // Send OTP for login
   async function handleSendOTP() {
@@ -66,8 +44,9 @@ export default function LoginScreen() {
     setOtpLoading(true);
     try {
       const { data } = await api.post('/auth/send-otp', { phone });
-      
+
       if (data.success) {
+        setOtp('');
         setOtpSent(true);
         setCountdown(60);
         Alert.alert('Success', 'OTP sent successfully!');
@@ -99,9 +78,7 @@ export default function LoginScreen() {
       if (data.success) {
         await api.setToken(data.token);
         await api.setUser(data.user);
-        await SecureStore.setItemAsync('token', data.token);
-        await SecureStore.setItemAsync('user_data', JSON.stringify(data.user));
-        
+
         if (data.user.role === 'mechanic') {
           router.replace('/mechanic/dashboard');
         } else {

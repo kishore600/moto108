@@ -124,7 +124,7 @@ export default function ProfileScreen() {
       Alert.alert('Success', 'Profile updated successfully');
     } catch (error: any) {
       console.log(error);
-      Alert.alert('Error', error.response?.data?.error || 'Failed to update profile');
+      Alert.alert('Error', error?.message || 'Failed to update profile');
     } finally {
       setUpdating(false);
     }
@@ -166,7 +166,7 @@ export default function ProfileScreen() {
         confirm_password: '',
       });
     } catch (error: any) {
-      Alert.alert('Error', error.response?.data?.error || 'Failed to change password');
+      Alert.alert('Error', error?.message || 'Failed to change password');
     } finally {
       setChangingPassword(false);
     }
@@ -187,7 +187,7 @@ export default function ProfileScreen() {
               await logout();
               router.replace('/(auth)/login');
             } catch (error: any) {
-              Alert.alert('Error', error.response?.data?.error || 'Failed to delete account');
+              Alert.alert('Error', error?.message || 'Failed to delete account');
             }
           },
         },

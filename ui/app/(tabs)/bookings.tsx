@@ -96,7 +96,7 @@ export default function BookingsScreen() {
               await loadBookings();
             } catch (error: any) {
               console.error(error);
-              Alert.alert("Error", error?.message ?? "Something went wrong");
+              Alert.alert("Error", error?.message ?? "Failed to delete booking");
             }
           },
         },

@@ -2,13 +2,12 @@
 import { useState, useEffect } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform, ActivityIndicator, ScrollView, Alert } from 'react-native';
 import { router, Link } from 'expo-router';
-import { useAuth } from '@/context/AuthContext';
-import * as SecureStore from 'expo-secure-store';
 import { api } from '@/lib/api';
 
+// Already-logged-in users are redirected by AuthContext.checkSession()
+// at app boot (see app/_layout.tsx), so this screen doesn't duplicate that check.
 export default function SignupScreen() {
   const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
   const [fullName, setFullName] = useState('');
   const [phone, setPhone] = useState('');
   const [role, setRole] = useState<'customer' | 'mechanic'>('customer');
@@ -18,10 +17,9 @@ export default function SignupScreen() {
   const [otpLoading, setOtpLoading] = useState(false);
   const [countdown, setCountdown] = useState(0);
   const [step, setStep] = useState<'details' | 'otp'>('details');
-  const { user } = useAuth();
 
   useEffect(() => {
-    let timer: NodeJS.Timeout;
+    let timer: ReturnType<typeof setTimeout>;
     if (countdown > 0) {
       timer = setTimeout(() => setCountdown(countdown - 1), 1000);
     }
@@ -29,33 +27,13 @@ export default function SignupScreen() {
   }, [countdown]);
 
   useEffect(() => {
-    checkExistingSession();
-  }, [user]);
-
-  useEffect(() => {
     if (otp.length === 6 && otpSent) {
       handleVerifyOTP();
     }
   }, [otp]);
 
-  async function checkExistingSession() {
-    try {
-      const token = await SecureStore.getItemAsync('token');
-      const userData = await SecureStore.getItemAsync('user_data');
-      if (token && userData && user) {
-        if (user.role === 'mechanic') {
-          router.replace('/mechanic/dashboard');
-        } else {
-          router.replace('/(tabs)/customer');
-        }
-      }
-    } catch (error) {
-      console.error('Error checking session:', error);
-    }
-  }
-
   async function handleSendOTP() {
-    // Only validate phone and name (email and password are optional)
+    // Only validate phone and name (email is optional)
     if (!fullName) {
       Alert.alert('Error', 'Please enter your full name');
       return;
@@ -76,17 +54,12 @@ export default function SignupScreen() {
       }
     }
 
-    // Optional password validation (only if provided)
-    if (password && password.length < 6) {
-      Alert.alert('Error', 'Password must be at least 6 characters');
-      return;
-    }
-
     setOtpLoading(true);
     try {
       const { data } = await api.post('/auth/send-signup-otp', { phone });
-      
+
       if (data.success) {
+        setOtp('');
         setOtpSent(true);
         setStep('otp');
         setCountdown(60);
@@ -117,7 +90,6 @@ export default function SignupScreen() {
         phone,
         otp,
         email: email || null, // Send null if not provided
-        password: password || null, // Send null if not provided
         fullName,
         role
       });
@@ -125,9 +97,7 @@ export default function SignupScreen() {
       if (data.success) {
         await api.setToken(data.token);
         await api.setUser(data.user);
-        await SecureStore.setItemAsync('token', data.token);
-        await SecureStore.setItemAsync('user_data', JSON.stringify(data.user));
-        
+
         if (data.user.role === 'mechanic') {
           router.replace('/mechanic/dashboard');
         } else {
@@ -193,7 +163,7 @@ export default function SignupScreen() {
 
                   <View style={styles.optionalSection}>
                     <Text style={styles.optionalLabel}>Optional Information</Text>
-                    <Text style={styles.optionalHint}>You can skip these if you prefer</Text>
+                    <Text style={styles.optionalHint}>You can skip this if you prefer</Text>
                   </View>
 
                   <TextInput
@@ -204,16 +174,6 @@ export default function SignupScreen() {
                     onChangeText={setEmail}
                     autoCapitalize="none"
                     keyboardType="email-address"
-                    editable={!otpLoading}
-                  />
-
-                  <TextInput
-                    style={styles.input}
-                    placeholder="Password (Optional)"
-                    placeholderTextColor="#94A3B8"
-                    value={password}
-                    onChangeText={setPassword}
-                    secureTextEntry
                     editable={!otpLoading}
                   />
 

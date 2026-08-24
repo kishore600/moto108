@@ -1927,7 +1927,7 @@ export default function CustomerScreen() {
       console.error("OTP verification error:", error);
       Alert.alert(
         "Verification Failed",
-        error.response?.data?.error || "Invalid OTP. Please try again.",
+        error?.message || "Invalid OTP. Please try again.",
       );
     } finally {
       setCompletingService(false);
@@ -1970,7 +1970,7 @@ export default function CustomerScreen() {
     } catch (error: any) {
       Alert.alert(
         "Error",
-        error.response?.data?.error || "Failed to submit rating",
+        error?.message || "Failed to submit rating",
       );
     } finally {
       setCompletingService(false);
