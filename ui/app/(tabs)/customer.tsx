@@ -492,6 +492,34 @@ export default function CustomerScreen() {
     activeBookingRef.current = activeBooking;
   }, [activeBooking]);
 
+  // ✅ NEW — tracks the last status we already reacted to (alerted on /
+  // opened a modal for), so the socket handler AND the new polling
+  // fallback below can share one code path without firing duplicate
+  // alerts when they both observe the same status.
+  const lastNotifiedStatusRef = useRef<string | null>(null);
+  useEffect(() => {
+    lastNotifiedStatusRef.current = activeBooking?.status ?? null;
+  }, [activeBooking?.id]);
+
+  // ---------------------------------------------------------------------
+  // ✅ FIX (double feedback popup) — tracks booking IDs whose completion
+  // has ALREADY been fully handled (rating modal opened / "Skip" chosen),
+  // across every possible source of a "completed" signal:
+  //   1) the "booking:status:updated" socket event (status: "completed")
+  //   2) the separate "service:completed" socket event
+  //   3) the reconciliation poll / app-foreground re-check re-fetching a
+  //      booking that is already completed
+  //   4) the customer's own OTP-verify path
+  // Backends commonly fire BOTH #1 and #2 for the same completion, and
+  // without a shared guard each one independently shows its own
+  // "Service Completed" alert / opens the rating modal — which is
+  // exactly what caused the feedback popup to appear twice. Every path
+  // below now checks this ref before showing anything, and marks the
+  // booking as handled the first time (whichever fires first wins; the
+  // rest become silent no-ops).
+  // ---------------------------------------------------------------------
+  const completedBookingIdsRef = useRef<Set<string>>(new Set());
+
   // ---------------------------------------------------------------------
   // ✅ FIX — fetchBookingOTP now takes an explicit `openModalIfFound`
   // flag instead of unconditionally deciding modal visibility itself.
@@ -545,9 +573,20 @@ export default function CustomerScreen() {
   // other piece of in-flight UI (OTP modal/pin, tracking modal, waiting
   // timer) is always torn down at the same time, so nothing stale can
   // linger and re-trigger something later.
+  //
+  // ✅ FIX (double feedback popup) — this function is now idempotent per
+  // booking id via completedBookingIdsRef: the FIRST caller (whichever
+  // completion signal arrives first) opens the rating modal and tears
+  // down state; every subsequent call for the SAME booking id — from a
+  // duplicate socket event, a stray reconciliation-poll match, or a
+  // second tap — is a silent no-op. This is what stops the rating
+  // popup from appearing a second time.
   // ---------------------------------------------------------------------
   const handleBookingCompleted = useCallback((bookingId: string | null | undefined) => {
     if (!bookingId) return;
+    if (completedBookingIdsRef.current.has(bookingId)) return; // already handled — prevent duplicate popup
+    completedBookingIdsRef.current.add(bookingId);
+
     setCompletedBookingId(bookingId);
     setShowRatingModal(true);
 
@@ -570,6 +609,101 @@ export default function CustomerScreen() {
     handleBookingCompleted(bookingId);
   }, [handleBookingCompleted]);
 
+  // ---------------------------------------------------------------------
+  // ✅ NEW — single shared function for applying a booking-status change.
+  // Pulled out of the socket handler so the reconciliation poll further
+  // down can reuse the EXACT same logic. This is what actually fixes the
+  // "arrived" screen getting stuck on a stale status — it's no longer
+  // only reachable via a single socket message that can be dropped (app
+  // backgrounded, brief reconnect, etc). Every code path that learns
+  // about a status change — socket push OR poll — now funnels through
+  // here, so the UI can never show two different ideas of what the
+  // booking's status is.
+  // ---------------------------------------------------------------------
+  const applyBookingStatusUpdate = useCallback(
+    (updatedBooking: any) => {
+      const current = activeBookingRef.current;
+      if (!current || updatedBooking?.id !== current.id) return;
+
+      if (updatedBooking.mechanic?.full_name) {
+        setMechanicName(updatedBooking.mechanic.full_name);
+      }
+
+      const prevStatus = lastNotifiedStatusRef.current;
+      const nextStatus = updatedBooking.status;
+
+      if (nextStatus === "on_the_way") {
+        setActiveBooking(updatedBooking);
+        if (prevStatus !== "on_the_way") {
+          Alert.alert("🚗 Mechanic On The Way!");
+        }
+        setCurrentTrackingModal("tracking");
+        setIsTracking(true);
+        socketService.requestMechanicLocation(updatedBooking.id);
+      } else if (nextStatus === "arrived") {
+        setActiveBooking(updatedBooking);
+        // -------------------------------------------------------------
+        // ✅ FIX — arriving no longer opens the OTP / "Service
+        // Completion" popup by itself. It only lets the customer know
+        // the mechanic is there and keeps the tracking screen visible.
+        // The popup opens ONLY when the mechanic actually generates a
+        // pin (via the "otp:generated" socket listener registered
+        // below), i.e. once they tap "Generate OTP" or "Complete
+        // Service" on their own dashboard — never just from tapping
+        // "Arrived".
+        // -------------------------------------------------------------
+        if (prevStatus !== "arrived") {
+          Alert.alert(
+            "📍 Mechanic Arrived",
+            "Your mechanic has arrived. They'll share a code with you shortly to complete the service.",
+          );
+        }
+        setCurrentTrackingModal("tracking");
+      } else if (nextStatus === "completed") {
+        // -------------------------------------------------------------
+        // ✅ FIX (double feedback popup) — this is THE real completion
+        // signal: the mechanic verified the OTP and the backend/
+        // mechanic app explicitly marked the booking "completed" (see
+        // socketService.updateBookingStatus(bookingId, "completed") in
+        // the mechanic dashboard's verifyMechanicOTP). We now check
+        // completedBookingIdsRef BEFORE showing the alert — if the
+        // "service:completed" socket event (handleServiceCompleted,
+        // below) already handled this exact booking id first, we skip
+        // the alert entirely instead of showing a second one. Either
+        // way we route through the single shared, idempotent
+        // handleBookingCompleted() so the rating popup — and ONLY the
+        // rating popup — appears once, with every other bit of state
+        // (OTP modal, tracking screen, etc.) cleared at the same time.
+        // We intentionally do NOT setActiveBooking here first;
+        // handleBookingCompleted clears it for us.
+        // -------------------------------------------------------------
+        const alreadyHandled = completedBookingIdsRef.current.has(updatedBooking.id);
+        if (!alreadyHandled && prevStatus !== "completed") {
+          Alert.alert(
+            "✅ Service Completed",
+            "Thank you for using our service! Please rate your experience.",
+          );
+        }
+        handleBookingCompleted(updatedBooking.id);
+        loadBookings();
+      } else if (nextStatus === "cancelled") {
+        if (prevStatus !== "cancelled") {
+          Alert.alert("❌ Request Cancelled", "Your request has been cancelled.");
+        }
+        setActiveBooking(null);
+        setWaitingForMechanic(false);
+        setIsTracking(false);
+        setCurrentTrackingModal(null);
+        loadBookings();
+      } else {
+        setActiveBooking(updatedBooking);
+      }
+
+      lastNotifiedStatusRef.current = nextStatus;
+    },
+    [handleBookingCompleted],
+  );
+
   useEffect(() => {
     const handleBookingAccepted = (data: {
       booking: Booking;
@@ -584,6 +718,10 @@ export default function CustomerScreen() {
       setWaitingForMechanic(false);
       setIsTracking(true);
       setCurrentTrackingModal("tracking");
+      // ✅ NEW — keep the shared "last status we reacted to" ref in sync
+      // so the reconciliation poll doesn't re-alert on the status we
+      // just handled here.
+      lastNotifiedStatusRef.current = (data.booking as any)?.status || "accepted";
 
       Alert.alert(
         "✓ Request Accepted!",
@@ -594,72 +732,30 @@ export default function CustomerScreen() {
       startTrackingMechanic(data.booking);
     };
 
+    // ✅ FIX — now just delegates to the shared applyBookingStatusUpdate()
+    // function above, so socket pushes and the reconciliation poll can
+    // never disagree about how a given status transition is handled.
     const handleStatusUpdated = (updatedBooking: Booking) => {
       console.log("Booking status updated:", updatedBooking);
-      const current = activeBookingRef.current;
-      if (!current || updatedBooking?.id !== current.id) return;
-
-      if (updatedBooking.mechanic?.full_name) {
-        setMechanicName(updatedBooking.mechanic.full_name);
-      }
-
-      if (updatedBooking.status === "on_the_way") {
-        setActiveBooking(updatedBooking);
-        Alert.alert("🚗 Mechanic On The Way!");
-        setCurrentTrackingModal("tracking");
-        setIsTracking(true);
-        socketService.requestMechanicLocation(updatedBooking.id);
-      } else if (updatedBooking.status === "arrived") {
-        setActiveBooking(updatedBooking);
-        // ---------------------------------------------------------------
-        // ✅ FIX — arriving no longer opens the OTP / "Service
-        // Completion" popup by itself. It only lets the customer know
-        // the mechanic is there and keeps the tracking screen visible.
-        // The popup opens ONLY when the mechanic actually generates a
-        // pin (via the "otp:generated" socket listener registered
-        // below), i.e. once they tap "Generate OTP" or "Complete
-        // Service" on their own dashboard — never just from tapping
-        // "Arrived".
-        // ---------------------------------------------------------------
-        Alert.alert(
-          "📍 Mechanic Arrived",
-          "Your mechanic has arrived. They'll share a code with you shortly to complete the service.",
-        );
-        setCurrentTrackingModal("tracking");
-      } else if (updatedBooking.status === "completed") {
-        // ---------------------------------------------------------------
-        // ✅ FIX — this is THE real completion signal: the mechanic
-        // verified the OTP and the backend/mechanic app explicitly
-        // marked the booking "completed" (see
-        // socketService.updateBookingStatus(bookingId, "completed") in
-        // the mechanic dashboard's verifyMechanicOTP). We route through
-        // the single shared handleBookingCompleted() so the rating
-        // popup — and ONLY the rating popup — appears now, with every
-        // other bit of state (OTP modal, tracking screen, etc.) cleared
-        // at the same time. We intentionally do NOT setActiveBooking
-        // here first; handleBookingCompleted clears it for us.
-        // ---------------------------------------------------------------
-        Alert.alert(
-          "✅ Service Completed",
-          "Thank you for using our service! Please rate your experience.",
-        );
-        handleBookingCompleted(updatedBooking.id);
-        loadBookings();
-      } else if (updatedBooking.status === "cancelled") {
-        Alert.alert("❌ Request Cancelled", "Your request has been cancelled.");
-        setActiveBooking(null);
-        setWaitingForMechanic(false);
-        setIsTracking(false);
-        setCurrentTrackingModal(null);
-        loadBookings();
-      } else {
-        setActiveBooking(updatedBooking);
-      }
+      applyBookingStatusUpdate(updatedBooking);
     };
 
+    // -----------------------------------------------------------------
+    // ✅ FIX (double feedback popup) — this is a SEPARATE socket event
+    // from "booking:status:updated" (status: "completed") above, and
+    // some backends fire both for the same completion. This handler now
+    // checks completedBookingIdsRef FIRST: if applyBookingStatusUpdate
+    // already handled this exact booking id (e.g. its socket event
+    // arrived a moment earlier), this becomes a silent no-op instead of
+    // popping a second "Service Completed" alert on top of the rating
+    // modal that's already showing. If this event arrives FIRST instead,
+    // it proceeds as before, and the later "booking:status:updated" for
+    // the same id will see it's already handled and skip its own alert.
+    // -----------------------------------------------------------------
     const handleServiceCompleted = (data: { bookingId: string }) => {
       const current = activeBookingRef.current;
       if (!current || data.bookingId !== current.id) return;
+      if (completedBookingIdsRef.current.has(data.bookingId)) return;
 
       Alert.alert(
         "✅ Service Completed!",
@@ -673,10 +769,14 @@ export default function CustomerScreen() {
             text: "Skip",
             style: "cancel",
             onPress: () => {
-              // ✅ FIX — "Skip" now tears down the same in-flight state
-              // handleBookingCompleted would have (OTP modal/pin,
-              // tracking modal, waiting timer), instead of only clearing
-              // activeBooking/isTracking and leaving OTP state stranded.
+              // ✅ FIX — "Skip" marks the booking as handled (so a later
+              // "booking:status:updated" completion event for the same
+              // id can't reopen anything) and tears down the same
+              // in-flight state handleBookingCompleted would have (OTP
+              // modal/pin, tracking modal, waiting timer), instead of
+              // only clearing activeBooking/isTracking and leaving OTP
+              // state stranded.
+              completedBookingIdsRef.current.add(current.id);
               setActiveBooking(null);
               setIsTracking(false);
               setCurrentTrackingModal(null);
@@ -797,7 +897,7 @@ export default function CustomerScreen() {
         clearInterval(timerInterval);
       }
     };
-  }, [handleBookingCompleted, showRatingFlow]);
+  }, [handleBookingCompleted, showRatingFlow, applyBookingStatusUpdate]);
 
   useEffect(() => {
     if (activeBooking?.id) {
@@ -805,6 +905,42 @@ export default function CustomerScreen() {
       socketService.requestMechanicLocation(activeBooking.id);
     }
   }, [activeBooking?.id]);
+
+  // ---------------------------------------------------------------------
+  // ✅ NEW — reconciliation poll. This is the actual fix for the
+  // "customer stuck on 'Mechanic is Coming!' after the mechanic dashboard
+  // already shows ARRIVED" bug: relying solely on the "booking:status:
+  // updated" socket event means a single dropped/late message (app
+  // briefly backgrounded, reconnect, race with room-join, etc.) leaves
+  // the customer's screen frozen on a stale status with nothing to ever
+  // correct it. While a booking is active, this quietly re-fetches it
+  // from the API every 6s and — ONLY if the server's status has moved
+  // past what we're currently showing — runs it through the exact same
+  // applyBookingStatusUpdate() the socket handler uses. So regardless of
+  // whether the update arrives via socket or this poll, it's handled
+  // identically (same alerts, same modal transitions, same dedupe via
+  // lastNotifiedStatusRef AND completedBookingIdsRef), and the tracking
+  // screen can no longer get permanently stuck, nor can this poll ever
+  // pop a duplicate completion alert.
+  // ---------------------------------------------------------------------
+  useEffect(() => {
+    const id = activeBooking?.id;
+    const status = activeBooking?.status;
+    if (!id || !["accepted", "on_the_way", "arrived"].includes(status)) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const { data } = await api.get(`/bookings/${id}`);
+        if (data && data.status !== activeBookingRef.current?.status) {
+          applyBookingStatusUpdate(data);
+        }
+      } catch (error) {
+        console.error("Booking status reconciliation poll failed:", error);
+      }
+    }, 6000);
+
+    return () => clearInterval(interval);
+  }, [activeBooking?.id, activeBooking?.status, applyBookingStatusUpdate]);
 
   // ---------------------------------------------------------------------
   // ✅ FIX — this effect used to force `setShowOTPModal(true)` the moment
@@ -833,11 +969,27 @@ export default function CustomerScreen() {
           if (activeBookingRef.current.mechanic_id) {
             socketService.requestMechanicLocation(activeBookingRef.current.id);
           }
+          // ✅ NEW — resuming from background is exactly when a socket
+          // event is most likely to have been missed, so force an
+          // immediate reconciliation check instead of waiting for the
+          // next 6s poll tick.
+          if (activeBookingRef.current.id) {
+            api
+              .get(`/bookings/${activeBookingRef.current.id}`)
+              .then(({ data }) => {
+                if (data && data.status !== activeBookingRef.current?.status) {
+                  applyBookingStatusUpdate(data);
+                }
+              })
+              .catch((error) =>
+                console.error("Foreground reconciliation check failed:", error),
+              );
+          }
         }
       },
     );
     return () => subscription.remove();
-  }, []);
+  }, [applyBookingStatusUpdate]);
 
   useEffect(() => {
     if (waitingForMechanic && activeBooking) {
@@ -1738,7 +1890,7 @@ export default function CustomerScreen() {
   // customer and enter it in their own app; see verifyMechanicOTP in the
   // mechanic dashboard). This is kept only in case a future "customer
   // self-serve" entry point is added, and if it ever runs it now routes
-  // completion through the same handleBookingCompleted() used
+  // completion through the same idempotent handleBookingCompleted() used
   // everywhere else, so the rating popup can never appear through two
   // different code paths with two different cleanup behaviors.
   // ---------------------------------------------------------------------

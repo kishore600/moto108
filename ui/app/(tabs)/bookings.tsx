@@ -311,46 +311,7 @@ export default function BookingsScreen() {
 
                 <View style={styles.ratingDivider} />
 
-                {/* Mechanic's rating of the customer */}
-                <View style={styles.ratingRow}>
-                  <View style={styles.ratingRowHeader}>
-                    <View style={styles.ratingTitleContainer}>
-                      <Ionicons
-                        name="construct-outline"
-                        size={16}
-                        color="#0F172A"
-                      />
-                      <Text style={styles.ratingTitle}>Mechanic's Rating</Text>
-                    </View>
-                    <Text
-                      style={[styles.ratingRoleBadge, styles.mechanicBadge]}
-                    >
-                      Mechanic
-                    </Text>
-                  </View>
-
-                  {hasMechanicRating ? (
-                    <>
-                      {renderStars(selectedRatingsBooking.mechanic_rating)}
-                      {selectedRatingsBooking.mechanic_review ? (
-                        <Text style={styles.reviewText} numberOfLines={4}>
-                          "{selectedRatingsBooking.mechanic_review}"
-                        </Text>
-                      ) : null}
-                    </>
-                  ) : (
-                    <View style={styles.noRatingRow}>
-                      <Ionicons
-                        name="time-outline"
-                        size={15}
-                        color="#94A3B8"
-                      />
-                      <Text style={styles.noRatingText}>
-                        Mechanic hasn't rated yet
-                      </Text>
-                    </View>
-                  )}
-                </View>
+               
               </View>
 
               {/* Service details */}
